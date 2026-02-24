@@ -10,6 +10,7 @@ import re
 import os
 import threading
 from khl import Message
+import khl.api as khl_api
 from typing import Optional, List, Dict
 import aiohttp
 
@@ -30,14 +31,21 @@ class MusicPlayer:
         self.process: Optional[subprocess.Popen] = None
         self.keep_alive_task = None
         self.voice_info = None
+        self.monitor_task = None
     
     async def join_channel(self, bot, guild_id: str, channel_id: str, channel_name: str) -> bool:
         """让机器人加入语音频道"""
+        import traceback
+        import datetime
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"🎵 [DEBUG-MUSIC-JOIN] [{current_time}] 开始执行 join_channel, channel_id={channel_id}, channel_name={channel_name}")
+        
         try:
-            from khl import api as khl_api
+            logger.info(f"🎵 [DEBUG-MUSIC-JOIN] [{current_time}] 调用 khl_api.Voice.join")
             result = await bot.client.gate.exec_req(
                 khl_api.Voice.join(channel_id=channel_id)
             )
+            logger.info(f"🎵 [DEBUG-MUSIC-JOIN] [{current_time}] join 成功返回: {result}")
             
             self.voice_info = result
             self.current_channel_id = channel_id
@@ -46,24 +54,33 @@ class MusicPlayer:
             logger.info(f"🎵 加入语音频道成功: {channel_name}, 推流信息: {result}")
             return True
         except Exception as e:
-            logger.error(f"❌ 加入语音频道失败: {e}")
+            logger.error(f"🎵 [DEBUG-MUSIC-JOIN] [{current_time}] 加入语音频道失败: {e}")
+            logger.error(f"🎵 [DEBUG-MUSIC-JOIN] [{current_time}] 完整堆栈: {traceback.format_exc()}")
             return False
     
     async def leave_channel(self, bot) -> bool:
         """让机器人离开语音频道"""
+        import traceback
+        import datetime
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"🎵 [DEBUG-MUSIC-LEAVE] [{current_time}] 开始执行 leave_channel, channel_id={self.current_channel_id}")
+        logger.info(f"🎵 [DEBUG-MUSIC-LEAVE] [{current_time}] 调用栈: {traceback.format_stack()}")
+        
         try:
-            from khl import api as khl_api
             if self.current_channel_id:
+                logger.info(f"🎵 [DEBUG-MUSIC-LEAVE] [{current_time}] 调用 khl_api.Voice.leave")
                 await bot.client.gate.exec_req(
                     khl_api.Voice.leave(channel_id=self.current_channel_id)
                 )
+                logger.info(f"🎵 [DEBUG-MUSIC-LEAVE] [{current_time}] leave 成功")
                 self.stop()
                 self.current_channel_id = None
                 self.current_guild_id = None
                 logger.info("🎵 已离开语音频道")
                 return True
         except Exception as e:
-            logger.error(f"❌ 离开语音频道失败: {e}")
+            logger.error(f"🎵 [DEBUG-MUSIC-LEAVE] [{current_time}] 离开语音频道失败: {e}")
+            logger.error(f"🎵 [DEBUG-MUSIC-LEAVE] [{current_time}] 完整堆栈: {traceback.format_exc()}")
             return False
     
     def stop(self):
@@ -84,13 +101,32 @@ class MusicPlayer:
         if self.keep_alive_task:
             self.keep_alive_task.cancel()
             self.keep_alive_task = None
+        
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            self.monitor_task = None
     
     async def keep_alive(self, bot):
         """保持语音连接活跃"""
+        import datetime
+        current_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"🎵 [DEBUG-KEEPALIVE] [{current_time_str}] 开始保持连接, is_playing={self.is_playing}, channel_id={self.current_channel_id}")
+        
         try:
             while self.is_playing and self.current_channel_id:
-                await asyncio.sleep(40)
-                logger.info("🎵 语音连接保持中...")
+                await asyncio.sleep(10)
+                
+                current_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if self.process and self.process.poll() is not None:
+                    logger.error(f"🎵 [DEBUG-KEEPALIVE] [{current_time_str}] FFmpeg进程已退出，退出码: {self.process.returncode}")
+                
+                logger.info(f"🎵 [DEBUG-KEEPALIVE] [{current_time_str}] 语音连接保持中, is_playing={self.is_playing}")
+                
+                if self.process and self.process.poll() is None:
+                    logger.info(f"🎵 [DEBUG-KEEPALIVE] [{current_time_str}] FFmpeg进程正常运行，PID={self.process.pid}")
+                else:
+                    logger.warning(f"🎵 [DEBUG-KEEPALIVE] [{current_time_str}] FFmpeg进程状态异常")
+                    
         except asyncio.CancelledError:
             logger.info("🎵 保持连接任务已取消")
         except Exception as e:
@@ -134,12 +170,41 @@ class MusicPlayer:
             if self.keep_alive_task:
                 self.keep_alive_task.cancel()
                 self.keep_alive_task = None
+            if self.monitor_task:
+                self.monitor_task.cancel()
+                self.monitor_task = None
             self.process.terminate()
             try:
                 self.process.wait(timeout=2)
             except:
                 self.process.kill()
             await asyncio.sleep(0.5)
+        
+        try:
+            voice_result = await bot.client.gate.exec_req(
+                khl_api.Voice.join(channel_id=self.current_channel_id)
+            )
+            self.voice_info = voice_result
+            logger.info(f"🎵 获取新推流地址成功: {voice_result}")
+        except Exception as e:
+            logger.error(f"❌ 获取新推流地址失败: {e}")
+            if not self.voice_info:
+                return False, "无法获取推流地址，请重新加入语音频道"
+            logger.warning("⚠️ 推流地址可能已过期，尝试重新加入频道...")
+            try:
+                await bot.client.gate.exec_req(khl_api.Voice.leave(channel_id=self.current_channel_id))
+            except:
+                pass
+            await asyncio.sleep(1)
+            try:
+                voice_result = await bot.client.gate.exec_req(
+                    khl_api.Voice.join(channel_id=self.current_channel_id)
+                )
+                self.voice_info = voice_result
+                logger.info(f"🎵 重新获取推流地址成功: {voice_result}")
+            except Exception as e2:
+                logger.error(f"❌ 重新获取推流地址失败: {e2}")
+                return False, "推流地址已过期，请使用 /join 命令重新加入语音频道"
         
         self.is_playing = True
         self.is_paused = False
@@ -182,6 +247,14 @@ class MusicPlayer:
                 stderr=subprocess.PIPE
             )
             
+            await asyncio.sleep(0.5)
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read().decode('utf-8', errors='ignore') if self.process.stderr else ''
+                logger.error(f"❌ FFmpeg进程启动失败，退出码: {self.process.returncode}")
+                logger.error(f"❌ FFmpeg错误输出: {stderr_output}")
+                self.is_playing = False
+                return False, f"FFmpeg启动失败"
+            
             await asyncio.sleep(2)
             
             if self.process.poll() is not None:
@@ -193,7 +266,7 @@ class MusicPlayer:
                 return False, f"FFmpeg启动失败: {stderr_text[-200:]}"
             
             self.keep_alive_task = asyncio.create_task(self.keep_alive(bot))
-            asyncio.create_task(self.monitor_playback(bot))
+            self.monitor_task = asyncio.create_task(self.monitor_playback(bot))
             
             logger.info(f"🎵 开始播放: {song['name']} - {song['artist']}")
             logger.info(f"🎵 FFmpeg进程ID: {self.process.pid}")
@@ -409,7 +482,7 @@ def set_music_player_info(voice_info: dict, channel_id: str, guild_id: str):
     music_player.current_guild_id = guild_id
     logger.info(f"🎵 已更新音乐播放器频道信息: {channel_id}")
 
-async def handle_music_command(msg: Message, bot, khl_api):
+async def handle_music_command(msg: Message, bot, voice_api):
     """处理用户的音乐命令"""
     user_id = msg.author_id
     message_type = type(msg).__name__
@@ -457,7 +530,7 @@ async def handle_music_command(msg: Message, bot, khl_api):
     logger.info(f"🎵 已向用户 {user_id} 发送搜索提示")
 
 
-async def handle_music_input(msg: Message, bot, khl_api):
+async def handle_music_input(msg: Message, bot, voice_api):
     """处理用户的音乐输入"""
     user_id = msg.author_id
     content = msg.content.strip()
@@ -542,7 +615,7 @@ def is_in_music_selection(user_id: str) -> bool:
     return user_id in music_selections
 
 
-async def handle_music_control(msg: Message, bot, khl_api, content: str):
+async def handle_music_control(msg: Message, bot, voice_api, content: str):
     """处理音乐控制命令"""
     global music_player
     

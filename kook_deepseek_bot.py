@@ -18,7 +18,7 @@ import json
 import random
 from openai import OpenAI
 from khl import Bot, Message
-from khl import api as khl_api
+import khl.api as khl_api
 from dotenv import load_dotenv
 
 # 配置日志（设置为INFO级别，只输出关键信息到控制台，由start_bots.py统一管理日志文件）
@@ -371,16 +371,42 @@ async def get_user_voice_channel_local(bot, guild_id: str, user_id: str) -> str:
 
 async def join_voice_channel_local(bot, channel_id: str, guild_id: str = None) -> dict:
     """让机器人加入语音频道（本地实现）"""
-    result = await bot.client.gate.exec_req(khl_api.Voice.join(channel_id=channel_id))
+    import traceback
+    import datetime
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"🎤 [DEBUG-JOIN] [{current_time}] 开始执行 join_voice_channel_local, channel_id={channel_id}")
     
-    if guild_id and result:
-        set_music_player_info(result, channel_id, guild_id)
-    
-    return result
+    try:
+        logger.info(f"🎤 [DEBUG-JOIN] [{current_time}] 调用 khl_api.Voice.join")
+        result = await bot.client.gate.exec_req(khl_api.Voice.join(channel_id=channel_id))
+        logger.info(f"🎤 [DEBUG-JOIN] [{current_time}] join 成功返回: {result}")
+        
+        if guild_id and result:
+            set_music_player_info(result, channel_id, guild_id)
+        
+        logger.info(f"🎤 [DEBUG-JOIN] [{current_time}] join_voice_channel_local 完成")
+        return result
+    except Exception as e:
+        logger.error(f"🎤 [DEBUG-JOIN] [{current_time}] join_voice_channel_local 失败: {e}")
+        logger.error(f"🎤 [DEBUG-JOIN] [{current_time}] 完整堆栈: {traceback.format_exc()}")
+        raise
 
 async def leave_voice_channel_local(bot, channel_id: str):
     """让机器人离开语音频道（本地实现）"""
-    await bot.client.gate.exec_req(khl_api.Voice.leave(channel_id=channel_id))
+    import traceback
+    import datetime
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"🎤 [DEBUG-LEAVE] [{current_time}] 开始执行 leave_voice_channel_local, channel_id={channel_id}")
+    logger.info(f"🎤 [DEBUG-LEAVE] [{current_time}] 调用栈: {traceback.format_stack()}")
+    
+    try:
+        logger.info(f"🎤 [DEBUG-LEAVE] [{current_time}] 调用 khl_api.Voice.leave")
+        await bot.client.gate.exec_req(khl_api.Voice.leave(channel_id=channel_id))
+        logger.info(f"🎤 [DEBUG-LEAVE] [{current_time}] leave 成功")
+    except Exception as e:
+        logger.error(f"🎤 [DEBUG-LEAVE] [{current_time}] leave_voice_channel_local 失败: {e}")
+        logger.error(f"🎤 [DEBUG-LEAVE] [{current_time}] 完整堆栈: {traceback.format_exc()}")
+        raise
 
 async def list_voice_channels_local(bot) -> list:
     """获取机器人加入的语音频道列表（本地实现）"""
