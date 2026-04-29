@@ -146,7 +146,7 @@ async def search_web(query: str):
         response = tavily.search(query=query, search_depth="basic", max_results=3)
         results = [{
             "title": _sanitize_text(r.get("title"), 100),
-            "snippet": _sanitize_text(r.get("content"), 300),
+            "snippet": _sanitize_text(r.get("content"), 200),
             "link": _sanitize_url(r.get("url")),
         } for r in response.get("results", [])]
         logger.info("✅ 搜索完成,共 %d 条", len(results))
@@ -345,6 +345,49 @@ async def call_deepseek_api(messages: list) -> str:
             "extra_body": {"thinking": {"type": "enabled"}},
         }
 
+    def _is_audit_err(e):
+        s = str(e)
+        return "Content Exists Risk" in s or "400" in s
+
+    def _slim_tool_msgs(msgs):
+        """把 tool 消息内容裁为仅 title + link(去掉最易触发审核的 snippet 正文)。"""
+        out = []
+        for m in msgs:
+            if m.get("role") == "tool":
+                try:
+                    items = json.loads(m["content"])
+                    if isinstance(items, list):
+                        items = [{"title": x.get("title", ""), "link": x.get("link", "")}
+                                 for x in items if isinstance(x, dict)]
+                        m = {**m, "content": json.dumps(items, ensure_ascii=False)}
+                except Exception:
+                    pass
+            out.append(m)
+        return out
+
+    def _safety_retry():
+        """分级降级:精简 tool 消息 → 剔除 tool 消息 + 防幻觉 system。"""
+        try:
+            logger.warning("⚠️ 工具结果触发审核,降级为标题+链接重试")
+            r = client.chat.completions.create(**_final_kwargs(_slim_tool_msgs(messages)))
+            return r.choices[0].message.content
+        except Exception as e:
+            if not _is_audit_err(e):
+                raise
+
+        logger.warning("⚠️ 降级后仍被拒,完全剔除工具结果并加防幻觉提示")
+        safety_msgs = list(original_messages) + [{
+            "role": "system",
+            "content": (
+                "注意:刚刚已为用户联网搜索,但搜索结果被安全过滤拦截了。"
+                "请如实告知用户'最新信息暂时不可用',然后基于训练知识简短作答。"
+                "不要否认你具备联网搜索的能力,不要说自己'没有实时联网功能'。"
+            ),
+        }]
+        r = client.chat.completions.create(**_final_kwargs(safety_msgs))
+        return ("(由于部分实时搜索内容未通过安全审核,已转用本地知识回答喵~)\n\n"
+                + r.choices[0].message.content)
+
     try:
         for round_idx in range(MAX_TOOL_ROUNDS + 1):
             if round_idx < MAX_TOOL_ROUNDS:
@@ -363,20 +406,8 @@ async def call_deepseek_api(messages: list) -> str:
             try:
                 response = client.chat.completions.create(**kwargs)
             except Exception as e:
-                err = str(e)
-                if used_tools and ("Content Exists Risk" in err or "400" in err):
-                    logger.warning("⚠️ 工具结果触发安全审核,剔除后重试")
-                    safety_msgs = list(original_messages) + [{
-                        "role": "system",
-                        "content": (
-                            "注意:刚刚已为用户联网搜索,但搜索结果被安全过滤拦截了。"
-                            "请如实告知用户'最新信息暂时不可用',然后基于自己的训练知识简短作答。"
-                            "不要否认你具备联网搜索的能力,不要说自己'没有实时联网功能'之类的话。"
-                        ),
-                    }]
-                    final = client.chat.completions.create(**_final_kwargs(safety_msgs))
-                    return ("(由于部分实时搜索内容未通过安全审核,已转用本地知识回答喵~)\n\n"
-                            + final.choices[0].message.content)
+                if used_tools and _is_audit_err(e):
+                    return _safety_retry()
                 raise
 
             msg = response.choices[0].message
