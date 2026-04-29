@@ -33,16 +33,18 @@ env/
 *.swo
 *~
 
-# Environment variables (sensitive)
+# Environment variables
 .env
-bot.env
+# bot.env 由用户决定是否提交(私密库可入库,公开库务必忽略)
 
 # Logs
 *.log
 
-# Data files
-*.json
-!package-lock.json
+# Data files (运行时数据,含用户隐私,不入库)
+data/*.json
+
+# 改造前的本地备份(含旧硬编码 key,不入库)
+_backup_local/
 
 # Executables
 *.exe
