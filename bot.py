@@ -346,8 +346,8 @@ async def call_deepseek_api(messages: list) -> str:
         }
 
     def _is_audit_err(e):
-        s = str(e)
-        return "Content Exists Risk" in s or "400" in s
+        # 仅匹配真实的内容审核拒绝;其他 400(协议错误等)直接 raise 暴露
+        return "Content Exists Risk" in str(e)
 
     def _slim_tool_msgs(msgs):
         """把 tool 消息内容裁为仅 title + link(去掉最易触发审核的 snippet 正文)。"""
@@ -417,21 +417,20 @@ async def call_deepseek_api(messages: list) -> str:
             used_tools = True
             logger.info("模型请求工具调用 (%d 个)", len(msg.tool_calls))
 
-            assistant_msg = {
+            # thinking 模式下,服务端强制要求 assistant tool_calls 消息携带
+            # reasoning_content 字段,即使 Round 0 是 thinking=disabled 没有产出
+            # 也必须填空字符串,否则 Round 1 切到 enabled 拼接时会 400。
+            messages.append({
                 "role": "assistant",
                 "content": msg.content,
+                "reasoning_content": getattr(msg, "reasoning_content", None) or "",
                 "tool_calls": [
                     {"id": tc.id, "type": tc.type,
                      "function": {"name": tc.function.name,
                                   "arguments": tc.function.arguments}}
                     for tc in msg.tool_calls
                 ],
-            }
-            # 工具调用场景下,reasoning_content(若有)需在后续轮次回传
-            reasoning = getattr(msg, "reasoning_content", None)
-            if reasoning:
-                assistant_msg["reasoning_content"] = reasoning
-            messages.append(assistant_msg)
+            })
 
             results = await asyncio.gather(*[_execute_tool(tc) for tc in msg.tool_calls])
             for tc, result in zip(msg.tool_calls, results):
