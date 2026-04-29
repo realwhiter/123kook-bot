@@ -1,0 +1,113 @@
+image:
+  type: object
+  description: 图片消息
+  properties:
+    type:
+      allOf:
+        - $ref: './_fields.yaml#/type'
+      example: 2
+    guild_id:
+      $ref: '../_index.yaml#/GuildId'
+    author:
+      $ref: '../_index.yaml#/User'
+    attachments:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - image
+        name:
+          type: string
+          description: 多媒体名
+          example: 'xxx.jpg'
+        url:
+          type: string
+          description: 附件链接
+          example: 'https://img.kookapp.cn/assets/2020-12/IHT5xxxxxA07o03m.jpg'
+
+video:
+  type: object
+  description: 视频消息
+  properties:
+    type:
+      allOf:
+        - $ref: './_fields.yaml#/type'
+      example: 3
+    guild_id:
+      $ref: '../_index.yaml#/GuildId'
+    author:
+      $ref: '../_index.yaml#/User'
+    attachments:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - video
+        name:
+          type: string
+          description: 多媒体名
+          example: 002iQMhagx07Fx0S4xxxx323o0E010.mp4
+        url:
+          type: string
+          description: 附件链接
+          example: 'https://img.kookapp.cn/attachments/2020-12/11/asd.mp4'
+        file_type:
+          description: 文件格式
+          type: string
+          example: 'video/mp4'
+        size:
+          type: integer
+          description: 大小 单位（B）
+          example: 722882
+        duration:
+          type: number
+          description: 视频时长（s）
+          example: 15.673
+        width:
+          type: integer
+          description: 视频宽度
+          example: 640
+        height:
+          type: integer
+          description: 视频高度
+          example: 480
+
+
+
+file:
+  type: object
+  description: 文件消息
+  properties:
+    type:
+      allOf:
+        - $ref: './_fields.yaml#/type'
+      example: 4
+    guild_id:
+      $ref: '../_index.yaml#/GuildId'
+    author:
+      $ref: '../_index.yaml#/User'
+    attachments:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - file
+        url:
+          type: string
+          example: 'https://img.kookapp.cn/attachments/2020-12/11/asd.txt'
+        file_type:
+          description: 文件格式
+          type: string
+          example: 'text/plain'
+        name:
+          type: string
+          description: 多媒体名
+        size:
+          type: integer
+          description: 大小 单位（B）
+          example: 2575670
+
+

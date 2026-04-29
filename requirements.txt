@@ -1,5 +1,5 @@
-khl.py
-openai
-python-dotenv
-tavily-python
-starlette
+khl.py>=0.3.17
+openai>=1.0.0
+python-dotenv>=1.0.0
+tavily-python>=0.3.0
+aiohttp>=3.9.0
