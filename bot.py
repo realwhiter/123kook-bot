@@ -119,19 +119,36 @@ search_tool = {
 tools = [search_tool]
 
 
+_PERCENT_ENC_RE = re.compile(r"(%[0-9A-Fa-f]{2}){2,}")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _sanitize_text(text: str, limit: int) -> str:
+    """裁剪文本,移除 percent-encoded 段(常从 URL 残留),折叠空白。"""
+    if not text:
+        return ""
+    text = _PERCENT_ENC_RE.sub("", text)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    return text[:limit]
+
+
+def _sanitize_url(url: str, limit: int = 80) -> str:
+    """URL 脱敏:把 percent-encoded 段折叠为占位符,再截断。"""
+    if not url:
+        return ""
+    return _PERCENT_ENC_RE.sub("...", url)[:limit]
+
+
 async def search_web(query: str):
-    """使用 Tavily 执行搜索并裁剪内容,降低敏感词风险。"""
+    """使用 Tavily 执行搜索并对结果做脱敏处理,降低 DeepSeek 安全审核误判风险。"""
     logger.info("🔍 Tavily 搜索: %s", query)
     try:
-        if any(w in query for w in ("时间", "几点", "日期")):
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return [{"title": "系统时间", "snippet": f"当前时间是:{now}", "link": "local"}]
-
         response = tavily.search(query=query, search_depth="basic", max_results=3)
-        results = []
-        for r in response.get("results", []):
-            content = (r.get("content") or "")[:300].replace("\n", " ")
-            results.append({"title": r.get("title"), "snippet": content, "link": r.get("url")})
+        results = [{
+            "title": _sanitize_text(r.get("title"), 100),
+            "snippet": _sanitize_text(r.get("content"), 300),
+            "link": _sanitize_url(r.get("url")),
+        } for r in response.get("results", [])]
         logger.info("✅ 搜索完成,共 %d 条", len(results))
         return results
     except Exception as e:
@@ -349,7 +366,15 @@ async def call_deepseek_api(messages: list) -> str:
                 err = str(e)
                 if used_tools and ("Content Exists Risk" in err or "400" in err):
                     logger.warning("⚠️ 工具结果触发安全审核,剔除后重试")
-                    final = client.chat.completions.create(**_final_kwargs(original_messages))
+                    safety_msgs = list(original_messages) + [{
+                        "role": "system",
+                        "content": (
+                            "注意:刚刚已为用户联网搜索,但搜索结果被安全过滤拦截了。"
+                            "请如实告知用户'最新信息暂时不可用',然后基于自己的训练知识简短作答。"
+                            "不要否认你具备联网搜索的能力,不要说自己'没有实时联网功能'之类的话。"
+                        ),
+                    }]
+                    final = client.chat.completions.create(**_final_kwargs(safety_msgs))
                     return ("(由于部分实时搜索内容未通过安全审核,已转用本地知识回答喵~)\n\n"
                             + final.choices[0].message.content)
                 raise
