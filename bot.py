@@ -20,7 +20,7 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 import khl.api as khl_api
-from khl import Bot, Message
+from khl import Bot, ChannelPrivacyTypes, Event, EventTypes, Message, MessageTypes
 
 from kook_music import (
     handle_music_command,
@@ -185,47 +185,38 @@ async def fetch_user_info(user_id: str):
         return None
 
 
-async def handle_checkin(msg: Message):
-    user_id = msg.author_id
+async def _do_checkin(user_id: str) -> str:
+    """执行签到并返回回复文本(纯函数,可被消息和按钮事件复用)。"""
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-
     if user_id not in user_database:
         await fetch_user_info(user_id)
 
     record = checkin_data.setdefault(user_id, {
         "last_checkin_date": "", "total_days": 0, "total_score": 0,
     })
-
     if record["last_checkin_date"] == today:
-        await msg.reply(
-            f"🐱 你今日已经签过到啦,不要贪心哦~\n"
-            f"累计签到:{record['total_days']}天\n当前积分:{record['total_score']}分"
-        )
-        return
+        return (f"🐱 你今日已经签过到啦,不要贪心哦~\n"
+                f"累计签到:{record['total_days']}天\n当前积分:{record['total_score']}分")
 
     score = random.randint(MIN_SCORE, MAX_SCORE)
     record["total_days"] += 1
     record["total_score"] += score
     record["last_checkin_date"] = today
     _save_json(CHECKIN_FILE, checkin_data)
-
     logger.info("📅 用户 %s 签到 +%d 积分,累计 %d 天", user_id, score, record["total_days"])
-    await msg.reply(
-        f"🎉 签到成功!\n获得积分:{score}分\n"
-        f"累计签到:{record['total_days']}天\n当前积分:{record['total_score']}分\n\n"
-        f"🎊 继续保持签到好习惯哦~"
-    )
+    return (f"🎉 签到成功!\n获得积分:{score}分\n"
+            f"累计签到:{record['total_days']}天\n当前积分:{record['total_score']}分\n\n"
+            f"🎊 继续保持签到好习惯哦~")
 
 
-async def handle_checkin_list(msg: Message):
+def _build_checkin_list_text() -> str:
+    """生成签到排行榜文本(纯函数)。"""
     if not checkin_data:
-        await msg.reply("🐱 还没有用户签到呢,快来做第一个签到的人吧~")
-        return
+        return "🐱 还没有用户签到呢,快来做第一个签到的人吧~"
 
     sorted_users = sorted(checkin_data.items(),
                           key=lambda x: x[1]["total_days"], reverse=True)[:10]
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     lines = ["🏆 **签到排行榜** 🏆\n", f"📅 统计时间:{now}\n"]
     for i, (uid, data) in enumerate(sorted_users, 1):
         name = uid
@@ -237,7 +228,121 @@ async def handle_checkin_list(msg: Message):
         lines.append(f"{i}. 用户:{name}\n   累计签到:{data['total_days']}天\n"
                      f"   当前积分:{data['total_score']}分\n")
     lines.append(f"目前已有 {len(sorted_users)} 位用户参与签到,继续加油哦~\n🎊 争取上榜吧!")
-    await msg.reply("\n".join(lines))
+    return "\n".join(lines)
+
+
+async def handle_checkin(msg: Message):
+    await msg.reply(await _do_checkin(msg.author_id))
+
+
+async def handle_checkin_list(msg: Message):
+    await msg.reply(_build_checkin_list_text())
+
+
+# ---------- 主菜单卡片 ----------
+def _build_main_menu_card() -> list:
+    """生成主菜单卡片 JSON。"""
+    def _btn(text, value, theme="primary"):
+        return {"type": "button", "theme": theme, "click": "return-val",
+                "value": value, "text": {"type": "plain-text", "content": text}}
+
+    return [{
+        "type": "card",
+        "theme": "secondary",
+        "size": "lg",
+        "modules": [
+            {"type": "header",
+             "text": {"type": "plain-text", "content": "🐱 哈基米机器人 主菜单"}},
+            {"type": "section", "text": {"type": "kmarkdown",
+             "content": "你好喵~ 我是这个频道的小助手,选择需要的功能或直接 @ 我聊天 ✨"}},
+            {"type": "divider"},
+
+            {"type": "header",
+             "text": {"type": "plain-text", "content": "🎮 互动"}},
+            {"type": "action-group", "elements": [
+                _btn("📅 每日签到", "menu:qd", "primary"),
+                _btn("🏆 签到排行", "menu:qdlist", "info"),
+            ]},
+            {"type": "divider"},
+
+            {"type": "header",
+             "text": {"type": "plain-text", "content": "🎤 语音 & 音乐"}},
+            {"type": "section", "text": {"type": "kmarkdown",
+             "content": ("**进出语音频道:** 点击下方按钮或发送 `进频道` / `离开`\n"
+                         "**点歌:** 我得先在语音频道里,然后发送 `听歌` 选歌\n"
+                         "**控制:** `暂停` / `继续` / `下一首` / `停止`")}},
+            {"type": "action-group", "elements": [
+                _btn("🚪 加入语音", "menu:join", "success"),
+                _btn("👋 离开语音", "menu:leave", "warning"),
+                _btn("🎵 点歌", "menu:music", "primary"),
+                _btn("⏹️ 停止", "menu:stop", "danger"),
+            ]},
+            {"type": "divider"},
+
+            {"type": "header",
+             "text": {"type": "plain-text", "content": "🤖 AI 对话"}},
+            {"type": "section", "text": {"type": "kmarkdown",
+             "content": ("**公聊:** @机器人 + 任意问题\n"
+                         "**私聊:** 直接发送任意问题\n"
+                         "我可以联网搜索最新资讯哦~")}},
+            {"type": "divider"},
+
+            {"type": "context", "elements": [
+                {"type": "kmarkdown",
+                 "content": "随时发送 `菜单` 重新唤起此卡片喵 (=^•ω•^=)"},
+            ]},
+        ],
+    }]
+
+
+async def handle_menu(msg: Message):
+    """发送主菜单卡片。"""
+    card = _build_main_menu_card()
+    await msg.reply(json.dumps(card, ensure_ascii=False), type=MessageTypes.CARD)
+
+
+# ---------- 按钮点击事件 ----------
+async def _send_to(target_id: str, is_private: bool, content: str):
+    """通过 KOOK API 发文本消息到 target_id(频道或私聊)。"""
+    if is_private:
+        await bot.client.gate.exec_req(khl_api.DirectMessage.create(
+            type=MessageTypes.TEXT.value, target_id=target_id, content=content))
+    else:
+        await bot.client.gate.exec_req(khl_api.Message.create(
+            type=MessageTypes.TEXT.value, target_id=target_id, content=content))
+
+
+_BTN_HINTS = {
+    "menu:join":   "🎤 请直接发送 `进频道` 或 `join`,我会列出可加入的语音频道喵~",
+    "menu:leave":  "👋 请直接发送 `离开` 或 `leave`,我就会从语音频道退出喵~",
+    "menu:music":  "🎵 请直接发送 `听歌` 或 `music`,然后输入歌名喵~(我得先在语音频道里哦)",
+    "menu:stop":   "⏹️ 请直接发送 `停止` 或 `stop`,我会立刻停下来喵~",
+}
+
+
+@bot.on_event(EventTypes.MESSAGE_BTN_CLICK)
+async def on_btn_click(_, event: Event):
+    body = event.body or {}
+    value = body.get("value", "")
+    user_id = body.get("user_id")
+    raw_target = body.get("target_id") or ""
+    is_private = event.channel_type == ChannelPrivacyTypes.PERSON
+    # 私聊场景下 body.target_id 可能为空,fallback 到 user_id
+    target = raw_target or user_id
+    logger.info("🔘 按钮点击: value=%s user=%s private=%s",
+                value, user_id, is_private)
+
+    try:
+        if value == "menu:qd":
+            await _send_to(target, is_private, await _do_checkin(user_id))
+        elif value == "menu:qdlist":
+            await _send_to(target, is_private, _build_checkin_list_text())
+        elif value in _BTN_HINTS:
+            await _send_to(target, is_private, _BTN_HINTS[value])
+        else:
+            logger.warning("未知按钮 value: %s", value)
+    except Exception as e:
+        logger.error("❌ 按钮处理异常: %s\n%s", e, traceback.format_exc())
 
 
 # ---------- 语音频道 ----------
@@ -477,6 +582,11 @@ async def handle_message(msg: Message):
         logger.info("📥 收到消息 [%s] %s: %s", message_type, user_id, msg.content)
 
         content = _strip_kook_tags(msg.content).lower()
+
+        # 主菜单
+        if content in ("menu", "/menu", "菜单", "主菜单", "help", "/help", "帮助"):
+            await handle_menu(msg)
+            return
 
         # 签到指令
         if content in ("qd", "/qd", "签到"):
