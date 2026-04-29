@@ -59,9 +59,10 @@ bot = Bot(token=KOOK_BOT_TOKEN)
 logger.info("✅ 机器人已配置为 WebSocket 模式")
 
 # ---------- 常量 ----------
-MODEL_CHAT = "deepseek-chat"          # V3,工具调用
-MODEL_REASONER = "deepseek-reasoner"  # R1,深度思考
+MODEL_NAME = "deepseek-v4-pro"        # 对话模型
+REASONING_EFFORT = "high"             # 思考强度:high / max
 MAX_HISTORY_LENGTH = 10               # 每用户保留的对话轮数
+MAX_TOOL_ROUNDS = 1                   # 单次对话允许的工具调用轮数(超出后强制收尾)
 
 DATA_DIR = "data"
 CHECKIN_FILE = os.path.join(DATA_DIR, "checkin_data.json")
@@ -302,49 +303,88 @@ async def handle_leave_voice(msg: Message):
 
 
 # ---------- DeepSeek 调用 ----------
+async def _execute_tool(tool_call) -> str:
+    """根据 tool_call 执行对应工具,返回 JSON 字符串。"""
+    name = tool_call.function.name
+    if name == "search_web":
+        query = json.loads(tool_call.function.arguments).get("query", "")
+        result = await search_web(query)
+        return json.dumps(result, ensure_ascii=False)
+    return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
+
+
 async def call_deepseek_api(messages: list) -> str:
-    """V3 工具判断 + R1 深度思考的双模型联动,带安全审核回退。"""
+    """ReAct 循环:工具判定阶段关闭思考,最终回答阶段开启思考。带安全审核回退。"""
+    messages = list(messages)
     original_messages = list(messages)
+    used_tools = False
+
+    def _final_kwargs(msgs):
+        """最终生成阶段的调用参数:开启思考 + high effort。"""
+        return {
+            "model": MODEL_NAME,
+            "messages": msgs,
+            "reasoning_effort": REASONING_EFFORT,
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+
     try:
-        logger.info("V3 模型分析中...")
-        first = client.chat.completions.create(
-            model=MODEL_CHAT, messages=list(messages), tools=tools, tool_choice="auto")
-        v3_msg = first.choices[0].message
-        has_search = False
+        for round_idx in range(MAX_TOOL_ROUNDS + 1):
+            if round_idx < MAX_TOOL_ROUNDS:
+                # 判定阶段:不思考,允许工具调用
+                kwargs = {
+                    "model": MODEL_NAME,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                }
+            else:
+                # 最终回答阶段:开启思考
+                kwargs = _final_kwargs(messages)
 
-        if v3_msg.tool_calls:
-            logger.info("V3 触发联网搜索")
-            search_tasks = [
-                search_web(json.loads(tc.function.arguments).get("query"))
-                for tc in v3_msg.tool_calls
-            ]
-            all_results = await asyncio.gather(*search_tasks)
-            search_content = ""
-            for i, res in enumerate(all_results):
-                if res:
-                    search_content += f"\n查询结果 {i+1}:\n{json.dumps(res, ensure_ascii=False)}\n"
-            if search_content.strip():
+            try:
+                response = client.chat.completions.create(**kwargs)
+            except Exception as e:
+                err = str(e)
+                if used_tools and ("Content Exists Risk" in err or "400" in err):
+                    logger.warning("⚠️ 工具结果触发安全审核,剔除后重试")
+                    final = client.chat.completions.create(**_final_kwargs(original_messages))
+                    return ("(由于部分实时搜索内容未通过安全审核,已转用本地知识回答喵~)\n\n"
+                            + final.choices[0].message.content)
+                raise
+
+            msg = response.choices[0].message
+            if not msg.tool_calls:
+                return msg.content
+
+            used_tools = True
+            logger.info("模型请求工具调用 (%d 个)", len(msg.tool_calls))
+
+            assistant_msg = {
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": [
+                    {"id": tc.id, "type": tc.type,
+                     "function": {"name": tc.function.name,
+                                  "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ],
+            }
+            # 工具调用场景下,reasoning_content(若有)需在后续轮次回传
+            reasoning = getattr(msg, "reasoning_content", None)
+            if reasoning:
+                assistant_msg["reasoning_content"] = reasoning
+            messages.append(assistant_msg)
+
+            results = await asyncio.gather(*[_execute_tool(tc) for tc in msg.tool_calls])
+            for tc, result in zip(msg.tool_calls, results):
                 messages.append({
-                    "role": "system",
-                    "content": (f"【当前实时背景】今天是"
-                                f"{datetime.datetime.now().strftime('%Y-%m-%d')}。"
-                                f"以下是搜索到的最新资讯:\n{search_content}"),
+                    "role": "tool", "tool_call_id": tc.id, "content": result,
                 })
-                has_search = True
 
-        logger.info("R1 模型深度思考中...")
-        try:
-            final = client.chat.completions.create(model=MODEL_REASONER, messages=messages)
-            return final.choices[0].message.content
-        except Exception as e:
-            err = str(e)
-            if has_search and ("Content Exists Risk" in err or "400" in err):
-                logger.warning("⚠️ 搜索结果触发安全审核,剔除后重试")
-                final = client.chat.completions.create(
-                    model=MODEL_REASONER, messages=original_messages)
-                return ("(由于部分实时搜索内容未通过安全审核,已转用本地知识回答喵~)\n\n"
-                        + final.choices[0].message.content)
-            raise
+        return msg.content or "喵... 想了好几轮还是没头绪~"
+
     except Exception as e:
         logger.error("DeepSeek 调用失败: %s\n%s", e, traceback.format_exc())
         return f"喵... 脑袋突然卡住了(错误:{e})"
