@@ -17,11 +17,13 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-# 把 KOOK voice/join 返回的 bitrate 改写成强制值(单位 kbps)
-# None = 跟 KOOK 给的码率(各频道不同,实测有 32k / 48k / 96k 等)。
-# 实测过 128k 被服务端踢出语音频道。KOOK 文档说"超 120% 会被关闭"
-# 是真的硬性限制,bot 没有任何错误日志,会被静默踢。
-# 要更高音质只能换 KOOK 服务器等级 / 升级频道权限,不能在 bot 端绕开。
+# 在 KOOK voice/join 返回的 bitrate 基础上乘的倍率。文档允许超 120%
+# 才会被踢,所以贴 1.2 拿能拿到的最高音质。频道 32k → 推 38k;
+# 64k → 76k;96k → 115k。改大于 1.2 大概率被服务端静默踢出频道。
+BITRATE_BOOST_RATIO: float = 1.2
+
+# 完全绕开 KOOK 给的 bitrate,强制用这个值(单位 kbps)。仅供调试。
+# None 时走 BITRATE_BOOST_RATIO 自动适配。
 FORCE_BITRATE_KBPS: Optional[int] = None
 
 import aiohttp
@@ -159,16 +161,15 @@ class MusicPlayer:
         ssrc = voice_info.get('audio_ssrc', '1111')
         pt = voice_info.get('audio_pt', '111')
         rtcp_mux = voice_info.get('rtcp_mux', True)
-        # KOOK 服务端硬限制推流码率(默认 48000),超过 120% 会被踢出频道
-        # voice/join 返回的 bitrate 才是当前频道允许的上限,以它为准
+        # KOOK 服务端硬限制推流码率;超 120% 会被静默踢出频道
+        base_bps = voice_info.get('bitrate', 48000)
         if FORCE_BITRATE_KBPS:
             bitrate_kbps = FORCE_BITRATE_KBPS
-            logger.warning(f"⚠️ FORCE_BITRATE_KBPS={FORCE_BITRATE_KBPS}k 强制覆盖 "
-                           f"KOOK 默认 {voice_info.get('bitrate', 48000) // 1000}k,"
-                           "如被踢出请改回 None")
+            logger.warning(f"⚠️ FORCE_BITRATE_KBPS={FORCE_BITRATE_KBPS}k "
+                           f"强制覆盖 KOOK 给的 {base_bps // 1000}k")
         else:
-            bitrate = voice_info.get('bitrate', 48000)
-            bitrate_kbps = max(8, int(bitrate) // 1000)
+            # int 截断保证不超 120%(浮点 64*1.2=76.8 → 76)
+            bitrate_kbps = max(8, int(base_bps * BITRATE_BOOST_RATIO) // 1000)
 
         rtp_url = f"rtp://{ip}:{port}"
         if not rtcp_mux and 'rtcp_port' in voice_info:
