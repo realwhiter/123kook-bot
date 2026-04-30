@@ -18,10 +18,11 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 # 把 KOOK voice/join 返回的 bitrate 改写成强制值(单位 kbps)
-# None = 跟 KOOK 给的码率(默认 48k,音质差)。
-# 用户实测把这个常量调高 KOOK 大多数时候不会立刻踢出,文档说的"超 120%
-# 会被关闭"是上限警告而非硬性截断。如果实际被踢出频道,就调回 None。
-FORCE_BITRATE_KBPS: Optional[int] = 128
+# None = 跟 KOOK 给的码率(各频道不同,实测有 32k / 48k / 96k 等)。
+# 实测过 128k 被服务端踢出语音频道。KOOK 文档说"超 120% 会被关闭"
+# 是真的硬性限制,bot 没有任何错误日志,会被静默踢。
+# 要更高音质只能换 KOOK 服务器等级 / 升级频道权限,不能在 bot 端绕开。
+FORCE_BITRATE_KBPS: Optional[int] = None
 
 import aiohttp
 import khl.api as khl_api
