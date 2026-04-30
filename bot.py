@@ -22,11 +22,36 @@ from tavily import TavilyClient
 import khl.api as khl_api
 from khl import Bot, Event, EventTypes, Message, MessageTypes
 
+# khl 0.3.17 的 api 模块没有 Voice 类,这里 polyfill,对应 KOOK
+# 的 /api/v3/voice/* 接口。req 装饰器会用 __qualname__ 构造 route
+# (Voice.join → /voice/join),所以类名必须叫 Voice。
+if not hasattr(khl_api, "Voice"):
+    class Voice:
+        @staticmethod
+        @khl_api.req("POST")
+        def join(channel_id, audio_ssrc=None, audio_pt=None,
+                 rtcp_mux=None, password=None):
+            ...
+
+        @staticmethod
+        @khl_api.req("POST")
+        def leave(channel_id):
+            ...
+
+        @staticmethod
+        @khl_api.req("GET")
+        def list():
+            ...
+
+    khl_api.Voice = Voice
+
+import kook_music
 from kook_music import (
     handle_music_command,
     handle_music_control,
     handle_music_input,
     is_in_music_selection,
+    music_selections,
     set_music_player_info,
 )
 
@@ -316,14 +341,6 @@ async def _send_text(channel_id: str, user_id: str, content: str):
             type=MessageTypes.TEXT.value, target_id=user_id, content=content))
 
 
-_BTN_HINTS = {
-    "menu:join":   "🎤 请直接发送 `进频道` 或 `join`,我会列出可加入的语音频道喵~",
-    "menu:leave":  "👋 请直接发送 `离开` 或 `leave`,我就会从语音频道退出喵~",
-    "menu:music":  "🎵 请直接发送 `听歌` 或 `music`,然后输入歌名喵~(我得先在语音频道里哦)",
-    "menu:stop":   "⏹️ 请直接发送 `停止` 或 `stop`,我会立刻停下来喵~",
-}
-
-
 @bot.on_event(EventTypes.MESSAGE_BTN_CLICK)
 async def on_btn_click(_, event: Event):
     body = event.body or {}
@@ -333,13 +350,36 @@ async def on_btn_click(_, event: Event):
     logger.info("🔘 按钮点击: value=%s user=%s channel=%s",
                 value, user_id, channel_id or "(私聊)")
 
+    async def reply(text):
+        await _send_text(channel_id, user_id, text)
+
+    # 需要 guild 上下文的按钮:私聊点 + channel.view 拿 guild_id
+    async def _need_guild():
+        if not channel_id:
+            await reply("❌ 此功能需要在服务器频道中使用喵~")
+            return None
+        gid = await _resolve_guild_id(channel_id)
+        if not gid:
+            await reply("❌ 无法获取服务器信息")
+        return gid
+
     try:
         if value == "menu:qd":
-            await _send_text(channel_id, user_id, await _do_checkin(user_id))
+            await reply(await _do_checkin(user_id))
         elif value == "menu:qdlist":
-            await _send_text(channel_id, user_id, _build_checkin_list_text())
-        elif value in _BTN_HINTS:
-            await _send_text(channel_id, user_id, _BTN_HINTS[value])
+            await reply(_build_checkin_list_text())
+        elif value == "menu:join":
+            gid = await _need_guild()
+            if gid:
+                await _do_join_voice_prompt(user_id, gid, reply)
+        elif value == "menu:leave":
+            await _do_leave_voice(reply)
+        elif value == "menu:music":
+            gid = await _need_guild()
+            if gid:
+                await _do_music_open(user_id, gid, reply)
+        elif value == "menu:stop":
+            await _do_music_stop(reply)
         else:
             logger.warning("未知按钮 value: %s", value)
     except Exception as e:
@@ -373,13 +413,19 @@ def _require_guild(msg: Message):
         return None
 
 
-async def handle_join_voice(msg: Message):
-    guild_id = _require_guild(msg)
-    if not guild_id:
-        await msg.reply("❌ 请在服务器频道中使用此命令")
-        return
+async def _resolve_guild_id(channel_id: str):
+    """通过 channel.view 反查频道所属的 guild_id(按钮事件无 guild,要查)。"""
+    try:
+        chan = await bot.client.gate.exec_req(
+            khl_api.Channel.view(target_id=channel_id))
+        return chan.get("guild_id")
+    except Exception as e:
+        logger.error("❌ 查频道详情失败: %s", e)
+        return None
 
-    user_id = msg.author_id
+
+async def _do_join_voice_prompt(user_id: str, guild_id: str, send_text):
+    """列出服务器语音频道并设置 voice_selections,等用户回复数字选择。"""
     try:
         result = await bot.client.gate.exec_req(
             khl_api.Channel.list(guild_id=guild_id, type=2))
@@ -387,19 +433,72 @@ async def handle_join_voice(msg: Message):
             {"id": item.get("id"), "name": item.get("name", "未知频道")}
             for item in result.get("items", [])
         ]
-
         if not voice_channels:
-            await msg.reply("❌ 当前服务器没有可用的语音频道")
+            await send_text("❌ 当前服务器没有可用的语音频道")
             return
-
         voice_selections[user_id] = {"guild_id": guild_id, "channels": voice_channels}
         text = "🎤 请选择要进入的语音频道:\n\n"
         text += "\n".join(f"{i}. {vc['name']}" for i, vc in enumerate(voice_channels, 1))
         text += "\n\n请回复数字编号(如:1)"
-        await msg.reply(text)
+        await send_text(text)
     except Exception as e:
         logger.error("❌ 获取频道列表失败: %s", e)
-        await msg.reply(f"❌ 获取频道列表失败:{e}")
+        await send_text(f"❌ 获取频道列表失败:{e}")
+
+
+async def _do_leave_voice(send_text):
+    """让 bot 离开它所在的所有语音频道。"""
+    try:
+        voice_channels = await list_voice_channels_local()
+        if not voice_channels:
+            await send_text("😿 我现在不在任何语音频道中哦")
+            return
+        for vc in voice_channels:
+            cid = vc.get("id")
+            if cid:
+                await leave_voice_channel_local(cid)
+                await send_text(f"👋 已离开 {vc.get('name', '语音频道')},下次再见啦~")
+                return
+        await send_text("😿 我现在不在任何语音频道中哦")
+    except Exception as e:
+        logger.error("❌ 离开语音频道失败: %s", e)
+        await send_text(f"❌ 离开语音频道失败啦:{e}")
+
+
+async def _do_music_open(user_id: str, guild_id: str, send_text):
+    """打开点歌流程:检查 bot 是否在语音频道,然后设状态等用户输入歌名。"""
+    try:
+        result = await bot.client.gate.exec_req(khl_api.Voice.list())
+        if not result.get("items"):
+            await send_text(
+                "❌ 机器人当前不在语音频道中,无法播放音乐哦!\n\n"
+                "请先点 [🚪 加入语音] 或发送 `进频道` 让我进入语音频道喵~")
+            return
+        music_selections[user_id] = {"guild_id": guild_id, "step": "waiting_keyword"}
+        await send_text("🎵 好的,让我来帮你播放音乐!\n\n请输入要搜索的歌曲名或歌手名")
+    except Exception as e:
+        logger.error("❌ 打开点歌失败: %s", e)
+        await send_text(f"❌ 打开点歌失败:{e}")
+
+
+async def _do_music_stop(send_text):
+    """停止音乐播放并离开语音频道。"""
+    mp = kook_music.music_player
+    if mp and mp.is_playing:
+        mp.stop()
+        if mp.current_channel_id:
+            await mp.leave_channel(bot)
+        await send_text("⏹️ 已停止播放并离开频道")
+    else:
+        await send_text("⏹️ 当前没有在播放音乐喵~")
+
+
+async def handle_join_voice(msg: Message):
+    guild_id = _require_guild(msg)
+    if not guild_id:
+        await msg.reply("❌ 请在服务器频道中使用此命令")
+        return
+    await _do_join_voice_prompt(msg.author_id, guild_id, msg.reply)
 
 
 async def handle_leave_voice(msg: Message):
@@ -407,22 +506,7 @@ async def handle_leave_voice(msg: Message):
     if not guild_id:
         await msg.reply("❌ 请在服务器频道中使用此命令")
         return
-
-    try:
-        voice_channels = await list_voice_channels_local()
-        if not voice_channels:
-            await msg.reply("😿 我现在不在任何语音频道中哦")
-            return
-        for vc in voice_channels:
-            cid = vc.get("id")
-            if cid:
-                await leave_voice_channel_local(cid)
-                await msg.reply(f"👋 已离开 {vc.get('name', '语音频道')},下次再见啦~")
-                return
-        await msg.reply("😿 我现在不在任何语音频道中哦")
-    except Exception as e:
-        logger.error("❌ 离开语音频道失败: %s", e)
-        await msg.reply(f"❌ 离开语音频道失败啦:{e}")
+    await _do_leave_voice(msg.reply)
 
 
 # ---------- DeepSeek 调用 ----------
