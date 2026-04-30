@@ -20,7 +20,7 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 import khl.api as khl_api
-from khl import Bot, ChannelPrivacyTypes, Event, EventTypes, Message, MessageTypes
+from khl import Bot, Event, EventTypes, Message, MessageTypes
 
 from kook_music import (
     handle_music_command,
@@ -302,14 +302,18 @@ async def handle_menu(msg: Message):
 
 
 # ---------- 按钮点击事件 ----------
-async def _send_to(target_id: str, is_private: bool, content: str):
-    """通过 KOOK API 发文本消息到 target_id(频道或私聊)。"""
-    if is_private:
-        await bot.client.gate.exec_req(khl_api.DirectMessage.create(
-            type=MessageTypes.TEXT.value, target_id=target_id, content=content))
-    else:
+async def _send_text(channel_id: str, user_id: str, content: str):
+    """发文本消息:有 channel_id(公聊场景)走频道接口,无则走私聊接口。
+
+    button click 事件中,body.target_id 在公聊时是频道 id,私聊时为空字符串
+    (KOOK 系统事件的顶层 channel_type 不可靠,要用 body.target_id 判断)。
+    """
+    if channel_id:
         await bot.client.gate.exec_req(khl_api.Message.create(
-            type=MessageTypes.TEXT.value, target_id=target_id, content=content))
+            type=MessageTypes.TEXT.value, target_id=channel_id, content=content))
+    else:
+        await bot.client.gate.exec_req(khl_api.DirectMessage.create(
+            type=MessageTypes.TEXT.value, target_id=user_id, content=content))
 
 
 _BTN_HINTS = {
@@ -325,20 +329,17 @@ async def on_btn_click(_, event: Event):
     body = event.body or {}
     value = body.get("value", "")
     user_id = body.get("user_id")
-    raw_target = body.get("target_id") or ""
-    is_private = event.channel_type == ChannelPrivacyTypes.PERSON
-    # 私聊场景下 body.target_id 可能为空,fallback 到 user_id
-    target = raw_target or user_id
-    logger.info("🔘 按钮点击: value=%s user=%s private=%s",
-                value, user_id, is_private)
+    channel_id = body.get("target_id") or ""  # 公聊:频道 id;私聊:""
+    logger.info("🔘 按钮点击: value=%s user=%s channel=%s",
+                value, user_id, channel_id or "(私聊)")
 
     try:
         if value == "menu:qd":
-            await _send_to(target, is_private, await _do_checkin(user_id))
+            await _send_text(channel_id, user_id, await _do_checkin(user_id))
         elif value == "menu:qdlist":
-            await _send_to(target, is_private, _build_checkin_list_text())
+            await _send_text(channel_id, user_id, _build_checkin_list_text())
         elif value in _BTN_HINTS:
-            await _send_to(target, is_private, _BTN_HINTS[value])
+            await _send_text(channel_id, user_id, _BTN_HINTS[value])
         else:
             logger.warning("未知按钮 value: %s", value)
     except Exception as e:
