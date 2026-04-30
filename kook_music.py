@@ -709,7 +709,8 @@ async def handle_music_command(msg: Message, bot):
 
     try:
         result = await bot.client.gate.exec_req(khl_api.Voice.list())
-        if not result.get('items'):
+        items = result.get('items', [])
+        if not items:
             await msg.reply("❌ 我不在语音频道,先发 `进频道` 让我加入~")
             return
     except Exception as e:
@@ -717,9 +718,35 @@ async def handle_music_command(msg: Message, bot):
         await msg.reply("❌ 无法获取语音频道状态,先 `进频道`~")
         return
 
-    _ensure_player()
+    # bot 重启后 player 单例的 current_channel_id 会丢,从 KOOK 实际状态恢复
+    _sync_player_with_voice_list(items, guild_id)
     music_selections[user_id] = {'guild_id': guild_id, 'step': 'waiting_keyword'}
     await msg.reply("🎵 请输入要搜索的歌曲名或歌手名~")
+
+
+def _sync_player_with_voice_list(voice_items: list, guild_id: str):
+    """从 KOOK Voice.list 返回值同步 player 频道状态。
+
+    bot 进程重启后 music_player 是新单例,current_channel_id=None,但 KOOK
+    那边 bot 可能还在语音频道(WebSocket 重连前)。这种情况下 player 不知道
+    自己"还在哪",后续 play() 会以为没加入语音频道而失败。
+
+    这里在每次 Voice.list 检查通过后调用一次,把 KOOK 当前频道同步到 player。
+    voice_info 强制设 None,下次 _ensure_voice_endpoint 会自动 refresh 拿新地址。
+    """
+    if not voice_items:
+        return
+    player = _ensure_player()
+    if player.current_channel_id:
+        return  # 已经有,不覆盖
+    cid = voice_items[0].get('id')
+    if not cid:
+        return
+    player.current_channel_id = cid
+    player.current_guild_id = guild_id
+    player.voice_info = None
+    player.voice_info_used = False
+    logger.info(f"🎵 从 Voice.list 恢复 player 频道: {cid}")
 
 
 # ---------- 搜索卡片 ----------

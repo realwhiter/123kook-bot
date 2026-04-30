@@ -577,11 +577,14 @@ async def _do_music_open(user_id: str, guild_id: str, send_text):
     """打开点歌流程:检查 bot 是否在语音频道,然后设状态等用户输入歌名。"""
     try:
         result = await bot.client.gate.exec_req(khl_api.Voice.list())
-        if not result.get("items"):
+        items = result.get("items", [])
+        if not items:
             await send_text(
                 "❌ 机器人当前不在语音频道中,无法播放音乐哦!\n\n"
                 "请先点 [🚪 加入语音] 或发送 `进频道` 让我进入语音频道喵~")
             return
+        # bot 重启后 player 单例丢了 current_channel_id,这里同步回来
+        kook_music._sync_player_with_voice_list(items, guild_id)
         music_selections[user_id] = {"guild_id": guild_id, "step": "waiting_keyword"}
         await send_text("🎵 好的,让我来帮你播放音乐!\n\n请输入要搜索的歌曲名或歌手名")
     except Exception as e:
