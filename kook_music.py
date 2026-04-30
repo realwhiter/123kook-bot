@@ -294,7 +294,12 @@ class MusicPlayer:
         self._terminate_process()
 
     async def pause(self) -> bool:
-        """真暂停:杀 ffmpeg + 累计已播 wall-clock。"""
+        """真暂停:杀 ffmpeg + 累计已播 wall-clock。
+
+        cap _paused_offset_ms 到 duration-5s,防止 wall-clock 失控时(monitor
+        没及时切歌、ffmpeg 在向死端推流等)offset 超过歌曲长度,导致 resume
+        时 ffmpeg `-ss` 大于音频末尾,报 "Output file is empty"。
+        """
         if not self.is_playing or self.is_paused:
             return False
         if not self.process or self.process.poll() is not None:
@@ -303,6 +308,16 @@ class MusicPlayer:
             elapsed_ms = int((time.monotonic() - self._play_started_at) * 1000)
             self._paused_offset_ms += elapsed_ms
             self._play_started_at = None
+        # cap 到 duration-5s,5s 安全 buffer 给 ffmpeg seek 用
+        song = self.playlist[self.current_index] if self.playlist else None
+        duration = song.get('duration', 0) if song else 0
+        if duration > 0:
+            max_offset = max(0, duration - 5000)
+            if self._paused_offset_ms > max_offset:
+                logger.warning(
+                    "⚠️ 暂停时 wall-clock(%dms)超过歌长(%dms),cap 到 %dms",
+                    self._paused_offset_ms, duration, max_offset)
+                self._paused_offset_ms = max_offset
         if self.monitor_task:
             self.monitor_task.cancel()
             self.monitor_task = None
@@ -312,24 +327,46 @@ class MusicPlayer:
         return True
 
     async def resume(self, bot) -> bool:
-        """真继续:刷新推流 + 用 -ss offset 重启 ffmpeg。"""
+        """真继续:刷新推流 + 用 -ss offset 重启 ffmpeg。
+
+        offset 接近歌尾时直接切下一首,避免 ffmpeg `-ss 超过音频末尾`。
+        失败时把状态彻底清空(否则 is_paused 一直 True,反复点继续会循环失败)。
+        """
         if not self.is_paused:
             return False
         if not self.playlist or self.current_index >= len(self.playlist):
+            self._reset_after_failure()
             return False
         song = self.playlist[self.current_index]
+
+        # 暂停点离歌尾不到 2s → 这首相当于已经播完,直接切下一首
+        duration = song.get('duration', 0)
+        if duration > 0 and self._paused_offset_ms >= max(0, duration - 2000):
+            logger.info("🎵 暂停点已到歌尾,直接切下一首")
+            self.is_paused = False
+            self._paused_offset_ms = 0
+            if self.current_index + 1 < len(self.playlist):
+                self.current_index += 1
+                ok, _ = await self.play(bot, None,
+                                        self.playlist[self.current_index])
+                return ok
+            self._reset_after_failure()
+            return False
+
         song_url = song.get('url')
         if not song_url and song.get('id'):
             song_url = await music_api.get_play_url(song['id'])
         if not song_url:
+            self._reset_after_failure()
             return False
-        # resume 必然刷新推流(暂停期间地址通常已废)
         if not await self._refresh_voice_endpoint(bot):
+            self._reset_after_failure()
             return False
         ok, err = await self._start_playback(
             bot, song_url, offset_ms=self._paused_offset_ms)
         if not ok:
             logger.error(f"❌ resume 失败: {err}")
+            self._reset_after_failure()
             return False
         self.is_paused = False
         self.is_playing = True
@@ -337,6 +374,17 @@ class MusicPlayer:
         self.monitor_task = asyncio.create_task(self.monitor_playback(bot))
         logger.info(f"🎵 已继续 @ {self._paused_offset_ms}ms")
         return True
+
+    def _reset_after_failure(self):
+        """resume / 切歌失败时把状态恢复到"无播放",避免按钮死循环。"""
+        self.is_paused = False
+        self.is_playing = False
+        self._play_started_at = None
+        self._paused_offset_ms = 0
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            self.monitor_task = None
+        self._terminate_process()
 
     async def skip(self, bot) -> bool:
         """跳过当前歌:主动播下一首。"""
