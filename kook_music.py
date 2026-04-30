@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import khl.api as khl_api
-from khl import Message
+from khl import Message, MessageTypes
 
 logger = logging.getLogger(__name__)
 
@@ -573,10 +573,17 @@ class MusicAPI:
             'Accept-Language': 'zh-CN,zh;q=0.9',
         }
 
-    async def search(self, keyword: str, limit: int = 5) -> List[Dict]:
+    async def search(self, keyword: str, limit: int = 5,
+                     offset: int = 0) -> Tuple[List[Dict], int]:
+        """搜索歌曲。返回 (songs, total_count)。
+
+        付费歌(fee=1)在客户端过滤,所以 len(songs) 可能小于 limit;
+        total 是网易云返回的总命中数,翻页用它判断是否还有更多。
+        """
         try:
-            params = {'s': keyword, 'type': 1, 'limit': limit, 'offset': 0}
-            logger.info(f"🎵 搜索: {keyword}")
+            params = {'s': keyword, 'type': 1,
+                      'limit': limit, 'offset': offset}
+            logger.info(f"🎵 搜索: {keyword} (offset={offset})")
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     self.search_url, params=params,
@@ -588,10 +595,12 @@ class MusicAPI:
                 result = json.loads(text)
             except json.JSONDecodeError:
                 logger.warning(f"⚠️ 搜索返回非 JSON: {text[:200]}")
-                return []
+                return [], 0
 
+            data = result.get('result', {}) or {}
+            total = int(data.get('songCount', 0))
             songs = []
-            for item in result.get('result', {}).get('songs', []):
+            for item in data.get('songs', []):
                 if item.get('fee', 0) == 1:  # 付费歌跳过
                     continue
                 ar = item.get('artists') or item.get('ar') or []
@@ -604,11 +613,11 @@ class MusicAPI:
                               if item.get('album') else ''),
                     'duration': item.get('duration', 0),
                 })
-            logger.info(f"✅ 搜索完成,返回 {len(songs)} 首")
-            return songs
+            logger.info(f"✅ 搜索完成,返回 {len(songs)} 首(总命中 {total})")
+            return songs, total
         except Exception as e:
             logger.error(f"❌ 搜索失败: {e}")
-            return []
+            return [], 0
 
     async def get_play_url(self, song_id: int) -> Optional[str]:
         """获取歌曲实际 URL,过滤灰色/下架/默认提示音。"""
@@ -694,88 +703,256 @@ async def handle_music_command(msg: Message, bot):
     await msg.reply("🎵 请输入要搜索的歌曲名或歌手名~")
 
 
-def _parse_choice(content: str, max_n: int) -> Optional[List[int]]:
-    """解析多选输入:'1' / '1,3,5' / '1，3' / 'all'。返回 0-based 索引列表。
+# ---------- 搜索卡片 ----------
+SEARCH_PAGE_SIZE = 5
 
-    无效输入返回 None;有效但全越界返回 None。
-    """
-    s = content.strip().lower().replace(' ', '')
-    if not s:
-        return None
-    if s == 'all':
-        return list(range(max_n))
-    s = s.replace('，', ',')  # 全角逗号 → 半角
+
+def build_search_card(selection: dict) -> list:
+    """生成搜索结果卡片。selection 必须含 keyword / songs_cache / page / total。"""
+    keyword = selection.get('keyword', '')
+    page = selection.get('page', 0)
+    cache = selection.get('songs_cache', [])
+    total = selection.get('total', len(cache))
+
+    start = page * SEARCH_PAGE_SIZE
+    end = min(start + SEARCH_PAGE_SIZE, len(cache))
+    page_songs = cache[start:end]
+
+    # 还能不能往后翻:cache 里有没消费完的,或网易云那边还有没拿的
+    has_next = (end < len(cache)) or (len(cache) < total)
+    has_prev = page > 0
+
+    def _btn(text, value, theme="primary"):
+        return {"type": "button", "theme": theme, "click": "return-val",
+                "value": value,
+                "text": {"type": "plain-text", "content": text}}
+
+    modules = [{
+        "type": "header",
+        "text": {"type": "plain-text", "content": f"🔍 搜索:{keyword}"},
+    }]
+
+    if not page_songs:
+        modules.append({
+            "type": "section",
+            "text": {"type": "kmarkdown", "content": "📭 这一页没有结果"},
+        })
+    else:
+        lines = []
+        for i, s in enumerate(page_songs):
+            d = (s.get('duration', 0) or 0) // 1000
+            lines.append(f"`{start+i+1}`. **{s['name']}** - {s['artist']} "
+                         f"({d//60:02d}:{d%60:02d})")
+        modules.append({
+            "type": "section",
+            "text": {"type": "kmarkdown", "content": "\n".join(lines)},
+        })
+
+    modules.append({
+        "type": "context",
+        "elements": [{
+            "type": "kmarkdown",
+            "content": (f"第 {page+1} 页 · 共 {total or '?'} 首结果"
+                        f" · 直接发新关键词可重新搜索"),
+        }],
+    })
+    modules.append({"type": "divider"})
+
+    # 选号按钮(每页最多 5 个,跟实际本页歌数一致)
+    pick_btns = [_btn(str(i + 1), f"search:pick:{i}", "primary")
+                 for i in range(len(page_songs))]
+    if pick_btns:
+        modules.append({"type": "action-group", "elements": pick_btns})
+
+    # 操作按钮:全部入队 + 翻页 + 关闭
+    action_btns = [_btn("➕ 全部入队", "search:all", "success")]
+    if has_prev:
+        action_btns.append(_btn("⏪ 上页", "search:prev", "info"))
+    if has_next:
+        action_btns.append(_btn("⏩ 下页", "search:next", "info"))
+    action_btns.append(_btn("❌ 关闭", "search:close", "danger"))
+    modules.append({"type": "action-group", "elements": action_btns})
+
+    return [{"type": "card", "theme": "secondary", "size": "lg",
+             "modules": modules}]
+
+
+async def _send_or_update_search_card(bot, user_id: str, target_id: str):
+    """发送或就地更新某用户的搜索卡片(策略 B:update 失败回退新发)。"""
+    if user_id not in music_selections:
+        return
+    selection = music_selections[user_id]
+    content = json.dumps(build_search_card(selection), ensure_ascii=False)
+
+    msg_id = selection.get('card_msg_id')
+    if msg_id and selection.get('card_target_id') == target_id:
+        try:
+            await bot.client.gate.exec_req(khl_api.Message.update(
+                msg_id=msg_id, content=content))
+            return
+        except Exception as e:
+            logger.warning(f"⚠️ 更新搜索卡片失败,改为重发: {e}")
+            selection['card_msg_id'] = None
+
     try:
-        if ',' in s:
-            parts = [int(x) for x in s.split(',') if x]
+        result = await bot.client.gate.exec_req(khl_api.Message.create(
+            type=MessageTypes.CARD.value,
+            target_id=target_id, content=content))
+        new_msg_id = (result or {}).get('msg_id')
+        if new_msg_id:
+            selection['card_msg_id'] = new_msg_id
+            selection['card_target_id'] = target_id
         else:
-            parts = [int(s)]
-    except ValueError:
-        return None
-    out = []
-    for n in parts:
-        if 1 <= n <= max_n and (n - 1) not in out:
-            out.append(n - 1)
-    return out or None
+            logger.warning(f"⚠️ Message.create 未返回 msg_id: {result}")
+    except Exception as e:
+        logger.error(f"❌ 发送搜索卡片失败: {e}")
+
+
+async def _delete_search_card(bot, user_id: str):
+    """删除搜索卡 + 清掉 selection 状态。失败忽略(消息已不存在等)。"""
+    if user_id not in music_selections:
+        return
+    selection = music_selections[user_id]
+    msg_id = selection.get('card_msg_id')
+    if msg_id:
+        try:
+            await bot.client.gate.exec_req(
+                khl_api.Message.delete(msg_id=msg_id))
+        except Exception as e:
+            logger.debug(f"删除搜索卡失败(忽略): {e}")
+    del music_selections[user_id]
+
+
+async def _enqueue_or_play(bot, songs: List[Dict], guild_id: str
+                           ) -> Tuple[bool, str]:
+    """把 chosen 歌入队或立即播放。返回 (ok, feedback_text)。"""
+    player = _ensure_player()
+    if player.is_playing or player.is_paused:
+        player.playlist.extend(songs)
+        return True, (f"➕ 已加入队列 {len(songs)} 首,"
+                      f"当前队列共 {len(player.playlist)} 首")
+    player.playlist = list(songs)
+    player.current_index = 0
+    player.current_guild_id = guild_id
+    ok, status = await player.play(bot, None, songs[0])
+    if not ok:
+        return False, f"❌ {status}"
+    extra = f"(队列共 {len(songs)} 首)" if len(songs) > 1 else ""
+    return True, f"🎵 {status} {extra}".strip()
+
+
+async def handle_search_card_button(bot, value: str, user_id: str,
+                                    channel_id: str) -> dict:
+    """处理搜索卡 search:* 按钮。返回 {feedback?, refresh_music_card?}。
+
+    feedback:要发给点击者的文字(空字符串则不发)
+    refresh_music_card:True 则上层应刷新音乐卡(歌已入队/播放)
+    """
+    if user_id not in music_selections:
+        return {"feedback": "❌ 这张搜索卡已过期,请重新发起搜索"}
+
+    selection = music_selections[user_id]
+    if selection.get('step') != 'card_active':
+        return {"feedback": "❌ 这张搜索卡已过期"}
+
+    cache = selection.get('songs_cache', [])
+    page = selection.get('page', 0)
+    page_size = SEARCH_PAGE_SIZE
+    start = page * page_size
+    end = min(start + page_size, len(cache))
+
+    if value.startswith('search:pick:'):
+        try:
+            idx_in_page = int(value.split(':')[2])
+        except (ValueError, IndexError):
+            return {"feedback": "❌ 选项无效"}
+        global_idx = start + idx_in_page
+        if global_idx >= len(cache):
+            return {"feedback": "❌ 选项无效"}
+        chosen = [_song_to_play_dict(cache[global_idx])]
+        ok, fb = await _enqueue_or_play(bot, chosen, selection['guild_id'])
+        await _delete_search_card(bot, user_id)
+        return {"feedback": fb, "refresh_music_card": ok}
+
+    if value == 'search:all':
+        page_songs = cache[start:end]
+        if not page_songs:
+            return {"feedback": "❌ 这一页没有歌"}
+        chosen = [_song_to_play_dict(s) for s in page_songs]
+        ok, fb = await _enqueue_or_play(bot, chosen, selection['guild_id'])
+        await _delete_search_card(bot, user_id)
+        return {"feedback": fb, "refresh_music_card": ok}
+
+    if value == 'search:next':
+        next_page = page + 1
+        # cache 不够覆盖下一页时,从网易云补一批
+        if (next_page + 1) * page_size > len(cache):
+            offset = len(cache)
+            new_songs, total = await music_api.search(
+                selection['keyword'], limit=page_size, offset=offset)
+            cache.extend(new_songs)
+            selection['songs_cache'] = cache
+            selection['total'] = total
+        if next_page * page_size >= len(cache):
+            return {"feedback": "已到最后一页"}
+        selection['page'] = next_page
+        await _send_or_update_search_card(bot, user_id, channel_id)
+        return {}
+
+    if value == 'search:prev':
+        if page <= 0:
+            return {"feedback": "已是第一页"}
+        selection['page'] = page - 1
+        await _send_or_update_search_card(bot, user_id, channel_id)
+        return {}
+
+    if value == 'search:close':
+        await _delete_search_card(bot, user_id)
+        return {"feedback": "🗑️ 已关闭搜索"}
+
+    return {"feedback": f"❌ 未知按钮: {value}"}
+
+
+def _song_to_play_dict(s: Dict) -> Dict:
+    """把 search 出来的 song 项展开成播放器可消费的格式。"""
+    return {
+        'id': s['id'],
+        'name': s['name'],
+        'artist': s['artist'],
+        'album': s.get('album', ''),
+        'url': f"https://music.163.com/song/media/outer/url?id={s['id']}",
+    }
 
 
 async def handle_music_input(msg: Message, bot) -> bool:
-    """处理 music_selections 状态中的输入。返回 True 表示已处理。"""
+    """处理 music_selections 状态中的文字输入。返回 True 表示已处理。
+
+    waiting_keyword:首次输入歌名 → 搜索 → 发卡片 → 切到 card_active
+    card_active:发新关键词 → 重置到第 1 页重新搜索 + 更新原卡
+    """
     user_id = msg.author_id
     content = msg.content.strip()
     if user_id not in music_selections:
         return False
 
-    player = _ensure_player()
     selection = music_selections[user_id]
     step = selection.get('step')
 
-    if step == 'waiting_keyword':
-        songs = await music_api.search(content, limit=5)
+    if step in ('waiting_keyword', 'card_active'):
+        if not content:
+            await msg.reply("❌ 关键词不能为空")
+            return True
+        songs, total = await music_api.search(
+            content, limit=SEARCH_PAGE_SIZE, offset=0)
         if not songs:
             await msg.reply("❌ 没找到,换个关键词?")
             return True
-        selection['songs'] = songs
-        selection['step'] = 'waiting_choice'
-        lines = ["🔍 搜索结果:\n"]
-        for i, s in enumerate(songs, 1):
-            d = s.get('duration', 0) // 1000
-            lines.append(f"{i}. {s['name']} - {s['artist']} "
-                         f"({d//60:02d}:{d%60:02d})")
-        lines.append("\n回复编号选择(支持 `1,3,5` 多选 / `all` 全部加入队列)")
-        await msg.reply("\n".join(lines))
-        return True
-
-    if step == 'waiting_choice':
-        songs = selection.get('songs', [])
-        idxs = _parse_choice(content, len(songs))
-        if idxs is None:
-            await msg.reply("❌ 输入无效,例:`1` 或 `1,3` 或 `all`")
-            return True
-        chosen = [{
-            'id': songs[i]['id'],
-            'name': songs[i]['name'],
-            'artist': songs[i]['artist'],
-            'album': songs[i].get('album', ''),
-            'url': f"https://music.163.com/song/media/outer/url?id={songs[i]['id']}",
-        } for i in idxs]
-
-        # 已在播 → 追加到队尾;空闲 → 覆盖并立即播放第一首
-        if player.is_playing or player.is_paused:
-            player.playlist.extend(chosen)
-            await msg.reply(
-                f"➕ 已加入队列 {len(chosen)} 首,当前队列共 {len(player.playlist)} 首")
-        else:
-            player.playlist = list(chosen)
-            player.current_index = 0
-            player.current_guild_id = selection.get('guild_id')
-            ok, status = await player.play(bot, msg, chosen[0])
-            if ok:
-                extra = f"(队列共 {len(chosen)} 首)" if len(chosen) > 1 else ""
-                await msg.reply(f"🎵 {status} {extra}".strip())
-            else:
-                await msg.reply(f"❌ {status}")
-        del music_selections[user_id]
+        selection['keyword'] = content
+        selection['songs_cache'] = list(songs)
+        selection['total'] = total
+        selection['page'] = 0
+        selection['step'] = 'card_active'
+        await _send_or_update_search_card(bot, user_id, msg.channel_id)
         return True
 
     return False

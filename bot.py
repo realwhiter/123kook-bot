@@ -433,6 +433,16 @@ async def on_btn_click(_, event: Event):
                 await _send_or_update_music_card(channel_id)
         elif value.startswith("music:"):
             await _handle_music_card_button(value, user_id, channel_id, reply)
+        elif value.startswith("search:"):
+            if not channel_id:
+                await reply("❌ 搜索卡片只能在服务器频道使用喵~")
+            else:
+                result = await kook_music.handle_search_card_button(
+                    bot, value, user_id, channel_id)
+                if result.get("feedback"):
+                    await reply(result["feedback"])
+                if result.get("refresh_music_card"):
+                    await _send_or_update_music_card(channel_id)
         else:
             logger.warning("未知按钮 value: %s", value)
     except Exception as e:
