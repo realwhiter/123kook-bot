@@ -347,6 +347,10 @@ class MusicPlayer:
             if self.current_index < len(self.playlist):
                 next_song = self.playlist[self.current_index]
                 logger.info(f"🎵 自动连播: {next_song['name']}")
+                # 关键:置 None 后再调 play,否则 play 开头会 cancel
+                # self.monitor_task = 当前 task,等于自己取消自己,后续
+                # await 立刻抛 CancelledError,什么都没干就跳出
+                self.monitor_task = None
                 ok, status = await self.play(bot, None, next_song)
                 if not ok:
                     logger.warning(f"⚠️ 连播失败,跳过: {status}")
