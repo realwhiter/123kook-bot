@@ -92,9 +92,14 @@ MAX_TOOL_ROUNDS = 1                   # 单次对话允许的工具调用轮数(
 DATA_DIR = "data"
 CHECKIN_FILE = os.path.join(DATA_DIR, "checkin_data.json")
 USER_DB_FILE = os.path.join(DATA_DIR, "user_database.json")
+TOKEN_USAGE_FILE = os.path.join(DATA_DIR, "token_usage.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 MIN_SCORE, MAX_SCORE = 3, 10
+
+# 单用户每日 AI 对话 token 总配额(input + output 之和)
+# 粗算:DeepSeek v4-pro 含思考一次问答约 800-3000 tokens,50000 约 20-50 次对话
+DAILY_TOKEN_LIMIT_PER_USER = 50000
 
 # ---------- 状态 ----------
 bot_id = None
@@ -102,6 +107,7 @@ conversation_histories: dict = {}
 voice_selections: dict = {}
 checkin_data: dict = {}
 user_database: dict = {}
+token_usage: dict = {}  # {user_id: {"date": "YYYY-MM-DD", "total": int}}
 
 
 def _load_json(path: str) -> dict:
@@ -125,7 +131,34 @@ def _save_json(path: str, data: dict) -> None:
 
 checkin_data = _load_json(CHECKIN_FILE)
 user_database = _load_json(USER_DB_FILE)
-logger.info("✅ 加载数据:签到 %d 条,用户库 %d 条", len(checkin_data), len(user_database))
+token_usage = _load_json(TOKEN_USAGE_FILE)
+logger.info("✅ 加载数据:签到 %d 条,用户库 %d 条,token 使用 %d 条",
+            len(checkin_data), len(user_database), len(token_usage))
+
+
+# ---------- Token 限流 ----------
+def _today() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d")
+
+
+def _get_user_today_tokens(user_id: str) -> int:
+    """读用户当日 token 用量,跨天自动归零(惰性)。"""
+    rec = token_usage.get(user_id)
+    if not rec or rec.get("date") != _today():
+        return 0
+    return rec.get("total", 0)
+
+
+def _add_user_tokens(user_id: str, count: int) -> None:
+    if not user_id or count <= 0:
+        return
+    today = _today()
+    rec = token_usage.get(user_id)
+    if not rec or rec.get("date") != today:
+        rec = {"date": today, "total": 0}
+        token_usage[user_id] = rec
+    rec["total"] += count
+    _save_json(TOKEN_USAGE_FILE, token_usage)
 
 
 # ---------- 搜索工具 ----------
@@ -293,8 +326,9 @@ def _build_main_menu_card() -> list:
             {"type": "header",
              "text": {"type": "plain-text", "content": "🎤 语音 & 音乐"}},
             {"type": "section", "text": {"type": "kmarkdown",
-             "content": ("**进出语音频道:** 点击下方按钮或发送 `进频道` / `离开`\n"
-                         "**点歌:** 我得先在语音频道里,然后发送 `听歌` 选歌\n"
+             "content": ("**[🚪 加入语音] 按钮:** 我会直接进你所在的频道\n"
+                         "**`进频道` / `join` 文字命令:** 选指定频道进入\n"
+                         "**点歌:** 我得先在语音频道里,然后点 [🎵] 或发 `听歌`\n"
                          "**控制:** `暂停` / `继续` / `下一首` / `停止`")}},
             {"type": "action-group", "elements": [
                 _btn("🚪 加入语音", "menu:join", "success"),
@@ -371,7 +405,7 @@ async def on_btn_click(_, event: Event):
         elif value == "menu:join":
             gid = await _need_guild()
             if gid:
-                await _do_join_voice_prompt(user_id, gid, reply)
+                await _smart_join_voice(user_id, gid, reply)
         elif value == "menu:leave":
             await _do_leave_voice(reply)
         elif value == "menu:music":
@@ -422,6 +456,36 @@ async def _resolve_guild_id(channel_id: str):
     except Exception as e:
         logger.error("❌ 查频道详情失败: %s", e)
         return None
+
+
+async def _get_user_voice_channel(user_id: str, guild_id: str):
+    """查询用户当前所在的语音频道(KOOK 一个用户同一时刻只能在一个语音频道)。"""
+    try:
+        result = await bot.client.gate.exec_req(
+            khl_api.ChannelUser.getJoinedChannel(
+                page=1, page_size=50, guild_id=guild_id, user_id=user_id))
+        items = result.get("items", [])
+        return items[0] if items else None
+    except Exception as e:
+        logger.warning("查询用户语音频道失败: %s", e)
+        return None
+
+
+async def _smart_join_voice(user_id: str, guild_id: str, send_text):
+    """智能加入语音频道:优先进入用户当前所在的频道,失败再退回选择列表。"""
+    current = await _get_user_voice_channel(user_id, guild_id)
+    if current and current.get("id"):
+        cid, cname = current["id"], current.get("name", "语音频道")
+        try:
+            await join_voice_channel_local(cid, guild_id)
+            await send_text(f"🎉 已加入你所在的语音频道:**{cname}** 喵~")
+            return
+        except Exception as e:
+            logger.error("❌ 直接加入失败,切换到选择列表: %s", e)
+            await send_text(f"⚠️ 加入 {cname} 失败,改为选择频道喵...")
+
+    # 用户不在任何语音频道,或直接加入失败 → 列出所有频道供选择
+    await _do_join_voice_prompt(user_id, guild_id, send_text)
 
 
 async def _do_join_voice_prompt(user_id: str, guild_id: str, send_text):
@@ -520,11 +584,19 @@ async def _execute_tool(tool_call) -> str:
     return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
 
 
-async def call_deepseek_api(messages: list) -> str:
-    """ReAct 循环:工具判定阶段关闭思考,最终回答阶段开启思考。带安全审核回退。"""
+async def call_deepseek_api(messages: list, user_id: str = None) -> str:
+    """ReAct 循环:工具判定阶段关闭思考,最终回答阶段开启思考。带安全审核回退。
+
+    user_id:用于 token 用量记录(每次 API 调用后累加 total_tokens)。
+    """
     messages = list(messages)
     original_messages = list(messages)
     used_tools = False
+
+    def _track(resp):
+        """每次 API 调用后累计 token 到 user_id 当日用量。"""
+        if user_id and resp and getattr(resp, "usage", None):
+            _add_user_tokens(user_id, resp.usage.total_tokens)
 
     def _final_kwargs(msgs):
         """最终生成阶段的调用参数:开启思考 + high effort。"""
@@ -560,6 +632,7 @@ async def call_deepseek_api(messages: list) -> str:
         try:
             logger.warning("⚠️ 工具结果触发审核,降级为标题+链接重试")
             r = client.chat.completions.create(**_final_kwargs(_slim_tool_msgs(messages)))
+            _track(r)
             return r.choices[0].message.content
         except Exception as e:
             if not _is_audit_err(e):
@@ -575,6 +648,7 @@ async def call_deepseek_api(messages: list) -> str:
             ),
         }]
         r = client.chat.completions.create(**_final_kwargs(safety_msgs))
+        _track(r)
         return ("(由于部分实时搜索内容未通过安全审核,已转用本地知识回答喵~)\n\n"
                 + r.choices[0].message.content)
 
@@ -595,6 +669,7 @@ async def call_deepseek_api(messages: list) -> str:
 
             try:
                 response = client.chat.completions.create(**kwargs)
+                _track(response)
             except Exception as e:
                 if used_tools and _is_audit_err(e):
                     return _safety_retry()
@@ -722,6 +797,17 @@ async def handle_message(msg: Message):
         if message_type != "PrivateMessage" and bot_id not in mention:
             return
 
+        # 每日 token 用量检查
+        used_today = _get_user_today_tokens(user_id)
+        if used_today >= DAILY_TOKEN_LIMIT_PER_USER:
+            await msg.reply(
+                f"😿 喵~ 你今日 AI 对话已达每日上限"
+                f"(已用 {used_today:,} / {DAILY_TOKEN_LIMIT_PER_USER:,} tokens),"
+                f"请明天再来玩呀~\n\n"
+                f"签到、音乐、语音功能不受影响哦"
+            )
+            return
+
         await msg.reply("🐱正在思考中...")
 
         filtered_input = _strip_kook_tags(msg.content)
@@ -741,7 +827,7 @@ async def handle_message(msg: Message):
         context.extend(history)
         context.append({"role": "user", "content": filtered_input})
 
-        response = await call_deepseek_api(context)
+        response = await call_deepseek_api(context, user_id=user_id)
         if not response:
             await msg.reply("❌ DeepSeek API 调用失败,请稍后重试")
             return
