@@ -43,6 +43,12 @@ if not hasattr(khl_api, "Voice"):
         def list():
             ...
 
+        @staticmethod
+        @khl_api.req("POST")
+        def keepAlive(channel_id):
+            # khl req 把驼峰转 kebab,这里 → /voice/keep-alive
+            ...
+
     khl_api.Voice = Voice
 
 import kook_music

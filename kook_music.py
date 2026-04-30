@@ -46,9 +46,42 @@ class MusicPlayer:
         self.voice_info_used: bool = False
         # 异步任务
         self.monitor_task: Optional[asyncio.Task] = None
+        self.keepalive_task: Optional[asyncio.Task] = None
         # 播放进度估算(wall clock):用于 pause 时存 offset
         self._play_started_at: Optional[float] = None
         self._paused_offset_ms: int = 0
+
+    # ---------- KOOK 端口 keepalive(每 45s 调 voice/keep-alive) ----------
+    def _start_keepalive(self, bot):
+        """启 keepalive 循环;已在跑就跳过(幂等)。"""
+        if self.keepalive_task and not self.keepalive_task.done():
+            return
+        self.keepalive_task = asyncio.create_task(self._keepalive_loop(bot))
+
+    def _stop_keepalive(self):
+        if self.keepalive_task:
+            self.keepalive_task.cancel()
+            self.keepalive_task = None
+
+    async def _keepalive_loop(self, bot):
+        """按 KOOK 文档:每 45s 调一次 voice/keep-alive 防止端口被回收。
+
+        和 ffmpeg 推流分开管:推流只在 play 期间跑,但保活贯穿整个"在频道"
+        生命周期(包括 pause 期间),pause 时也别让 KOOK 回收端口。
+        """
+        try:
+            while self.current_channel_id:
+                await asyncio.sleep(45)
+                if not self.current_channel_id:
+                    break
+                try:
+                    await bot.client.gate.exec_req(khl_api.Voice.keepAlive(
+                        channel_id=self.current_channel_id))
+                    logger.debug(f"keepalive ✓ {self.current_channel_id}")
+                except Exception as e:
+                    logger.warning(f"⚠️ keepalive 失败: {e}")
+        except asyncio.CancelledError:
+            logger.debug("keepalive 循环已取消")
 
     # ---------- 推流端点 ----------
     async def _refresh_voice_endpoint(self, bot) -> bool:
@@ -118,6 +151,10 @@ class MusicPlayer:
         ssrc = voice_info.get('audio_ssrc', '1111')
         pt = voice_info.get('audio_pt', '111')
         rtcp_mux = voice_info.get('rtcp_mux', True)
+        # KOOK 服务端硬限制推流码率(默认 48000),超过 120% 会被踢出频道
+        # voice/join 返回的 bitrate 才是当前频道允许的上限,以它为准
+        bitrate = voice_info.get('bitrate', 48000)
+        bitrate_kbps = max(8, int(bitrate) // 1000)
 
         rtp_url = f"rtp://{ip}:{port}"
         if not rtcp_mux and 'rtcp_port' in voice_info:
@@ -130,7 +167,7 @@ class MusicPlayer:
         cmd += [
             '-re', '-i', song_url,
             '-map', '0:a',
-            '-acodec', 'libopus', '-ab', '128k',
+            '-acodec', 'libopus', '-ab', f'{bitrate_kbps}k',
             '-ac', '2', '-ar', '48000',
             '-filter:a', 'volume=0.8',
             '-f', 'rtp',
@@ -248,6 +285,7 @@ class MusicPlayer:
         self._play_started_at = time.monotonic()
         self._paused_offset_ms = 0
         self.monitor_task = asyncio.create_task(self.monitor_playback(bot))
+        self._start_keepalive(bot)
         logger.info(f"🎵 开始播放: {song['name']} - {song.get('artist', '?')}")
         return True, f"正在播放: {song['name']} - {song.get('artist', '?')}"
 
@@ -310,6 +348,7 @@ class MusicPlayer:
         if self.monitor_task:
             self.monitor_task.cancel()
             self.monitor_task = None
+        self._stop_keepalive()
         self._terminate_process()
 
     async def pause(self) -> bool:
@@ -391,6 +430,7 @@ class MusicPlayer:
         self.is_playing = True
         self._play_started_at = time.monotonic()
         self.monitor_task = asyncio.create_task(self.monitor_playback(bot))
+        self._start_keepalive(bot)
         logger.info(f"🎵 已继续 @ {self._paused_offset_ms}ms")
         return True
 
@@ -403,6 +443,7 @@ class MusicPlayer:
         if self.monitor_task:
             self.monitor_task.cancel()
             self.monitor_task = None
+        self._stop_keepalive()
         self._terminate_process()
 
     async def skip(self, bot) -> bool:
