@@ -31,6 +31,7 @@ class MusicPlayer:
         self.process: Optional[subprocess.Popen] = None
         self.keep_alive_task = None
         self.voice_info = None
+        self._voice_consumed = False
         self.monitor_task = None
     
     async def join_channel(self, bot, guild_id: str, channel_id: str, channel_name: str) -> bool:
@@ -48,9 +49,10 @@ class MusicPlayer:
             logger.info(f"🎵 [DEBUG-MUSIC-JOIN] [{current_time}] join 成功返回: {result}")
             
             self.voice_info = result
+            self._voice_consumed = False
             self.current_channel_id = channel_id
             self.current_guild_id = guild_id
-            
+
             logger.info(f"🎵 加入语音频道成功: {channel_name}, 推流信息: {result}")
             return True
         except Exception as e:
@@ -76,6 +78,7 @@ class MusicPlayer:
                 self.stop()
                 self.current_channel_id = None
                 self.current_guild_id = None
+                self.voice_info = None
                 logger.info("🎵 已离开语音频道")
                 return True
         except Exception as e:
@@ -87,6 +90,7 @@ class MusicPlayer:
         """停止播放"""
         self.is_playing = False
         self.is_paused = False
+        self._voice_consumed = False
         self.playlist = []
         self.current_index = 0
         
@@ -180,31 +184,46 @@ class MusicPlayer:
                 self.process.kill()
             await asyncio.sleep(0.5)
         
-        try:
-            voice_result = await bot.client.gate.exec_req(
-                khl_api.Voice.join(channel_id=self.current_channel_id)
-            )
-            self.voice_info = voice_result
-            logger.info(f"🎵 获取新推流地址成功: {voice_result}")
-        except Exception as e:
-            logger.error(f"❌ 获取新推流地址失败: {e}")
-            if not self.voice_info:
-                return False, "无法获取推流地址，请重新加入语音频道"
-            logger.warning("⚠️ 推流地址可能已过期，尝试重新加入频道...")
-            try:
-                await bot.client.gate.exec_req(khl_api.Voice.leave(channel_id=self.current_channel_id))
-            except:
-                pass
-            await asyncio.sleep(1)
+        if self.voice_info and not self._voice_consumed:
+            logger.info(f"🎵 复用现有推流地址，跳过 Voice.join: {self.voice_info}")
+        else:
+            if self.voice_info:
+                logger.info("🎵 推流地址已消费，先离开旧频道再重新加入")
+                try:
+                    await bot.client.gate.exec_req(
+                        khl_api.Voice.leave(channel_id=self.current_channel_id)
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ 离开旧推流地址失败，继续: {e}")
+                await asyncio.sleep(0.5)
+
             try:
                 voice_result = await bot.client.gate.exec_req(
                     khl_api.Voice.join(channel_id=self.current_channel_id)
                 )
                 self.voice_info = voice_result
-                logger.info(f"🎵 重新获取推流地址成功: {voice_result}")
-            except Exception as e2:
-                logger.error(f"❌ 重新获取推流地址失败: {e2}")
-                return False, "推流地址已过期，请使用 /join 命令重新加入语音频道"
+                self._voice_consumed = False
+                logger.info(f"🎵 获取新推流地址成功: {voice_result}")
+            except Exception as e:
+                logger.error(f"❌ 获取新推流地址失败: {e}")
+                if not self.voice_info:
+                    return False, "无法获取推流地址，请重新加入语音频道"
+                logger.warning("⚠️ 推流地址可能已过期，尝试重新加入频道...")
+                try:
+                    await bot.client.gate.exec_req(khl_api.Voice.leave(channel_id=self.current_channel_id))
+                except:
+                    pass
+                await asyncio.sleep(1)
+                try:
+                    voice_result = await bot.client.gate.exec_req(
+                        khl_api.Voice.join(channel_id=self.current_channel_id)
+                    )
+                    self.voice_info = voice_result
+                    self._voice_consumed = False
+                    logger.info(f"🎵 重新获取推流地址成功: {voice_result}")
+                except Exception as e2:
+                    logger.error(f"❌ 重新获取推流地址失败: {e2}")
+                    return False, "推流地址已过期，请使用 /join 命令重新加入语音频道"
         
         self.is_playing = True
         self.is_paused = False
@@ -246,7 +265,8 @@ class MusicPlayer:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
-            
+            self._voice_consumed = True
+
             await asyncio.sleep(0.5)
             if self.process.poll() is not None:
                 stderr_output = self.process.stderr.read().decode('utf-8', errors='ignore') if self.process.stderr else ''
@@ -478,6 +498,7 @@ def set_music_player_info(voice_info: dict, channel_id: str, guild_id: str):
     if music_player is None:
         music_player = MusicPlayer()
     music_player.voice_info = voice_info
+    music_player._voice_consumed = False
     music_player.current_channel_id = channel_id
     music_player.current_guild_id = guild_id
     logger.info(f"🎵 已更新音乐播放器频道信息: {channel_id}")
