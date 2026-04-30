@@ -130,7 +130,7 @@ class MusicPlayer:
         cmd += [
             '-re', '-i', song_url,
             '-map', '0:a',
-            '-acodec', 'libopus', '-ab', '48k',
+            '-acodec', 'libopus', '-ab', '128k',
             '-ac', '2', '-ar', '48000',
             '-filter:a', 'volume=0.8',
             '-f', 'rtp',
@@ -252,10 +252,29 @@ class MusicPlayer:
         return True, f"正在播放: {song['name']} - {song.get('artist', '?')}"
 
     async def monitor_playback(self, bot):
-        """监控 ffmpeg 退出后自动连播下一首。"""
+        """监控 ffmpeg 退出后自动连播下一首。
+
+        wall-clock 兜底:如果实际播放进度已经超过 duration+10s 但 ffmpeg
+        还活着(典型场景:推流端点被挤掉,ffmpeg 在向死端推 UDP 包没反馈),
+        主动 terminate 让"歌曲结束→连播"分支接管。
+        """
         try:
             while self.process and self.process.poll() is None:
                 await asyncio.sleep(1)
+                # 兜底超时检查
+                song = (self.playlist[self.current_index]
+                        if self.playlist
+                        and self.current_index < len(self.playlist)
+                        else None)
+                duration = song.get('duration', 0) if song else 0
+                if duration > 0:
+                    progress = self.get_progress_ms()
+                    if progress > duration + 10000:
+                        logger.warning(
+                            "⚠️ 已播 %.1fs 超过歌长 %.1fs,主动终止 ffmpeg 切下一首",
+                            progress / 1000, duration / 1000)
+                        self._terminate_process()
+                        break
             # 已退出。被外部 stop/pause 主动改了状态就不连播
             if not self.is_playing or self.is_paused:
                 return
