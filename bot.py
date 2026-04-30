@@ -329,11 +329,13 @@ def _build_main_menu_card() -> list:
              "content": ("**[🚪 加入语音] 按钮:** 我会直接进你所在的频道\n"
                          "**`进频道` / `join` 文字命令:** 选指定频道进入\n"
                          "**点歌:** 我得先在语音频道里,然后点 [🎵] 或发 `听歌`\n"
-                         "**控制:** `暂停` / `继续` / `下一首` / `停止`")}},
+                         "**多选:** 选歌时回复 `1,3,5` 或 `all` 批量入队\n"
+                         "**控制:** `暂停` / `继续` / `下一首` / `停止` / `队列`")}},
             {"type": "action-group", "elements": [
                 _btn("🚪 加入语音", "menu:join", "success"),
                 _btn("👋 离开语音", "menu:leave", "warning"),
                 _btn("🎵 点歌", "menu:music", "primary"),
+                _btn("⏭️ 下一首", "menu:next", "info"),
                 _btn("⏹️ 停止", "menu:stop", "danger"),
             ]},
             {"type": "divider"},
@@ -414,6 +416,8 @@ async def on_btn_click(_, event: Event):
                 await _do_music_open(user_id, gid, reply)
         elif value == "menu:stop":
             await _do_music_stop(reply)
+        elif value == "menu:next":
+            await _do_music_skip(reply)
         else:
             logger.warning("未知按钮 value: %s", value)
     except Exception as e:
@@ -521,12 +525,27 @@ async def _do_leave_voice(send_text):
             cid = vc.get("id")
             if cid:
                 await leave_voice_channel_local(cid)
+                _reset_music_player_voice_state()
                 await send_text(f"👋 已离开 {vc.get('name', '语音频道')},下次再见啦~")
                 return
         await send_text("😿 我现在不在任何语音频道中哦")
     except Exception as e:
         logger.error("❌ 离开语音频道失败: %s", e)
         await send_text(f"❌ 离开语音频道失败啦:{e}")
+
+
+def _reset_music_player_voice_state():
+    """离开语音频道后清掉 music_player 残留的推流状态,
+    避免下次进频道再点歌时误用过期 voice_info。"""
+    mp = kook_music.music_player
+    if mp is None:
+        return
+    if mp.is_playing:
+        mp.stop()
+    mp.voice_info = None
+    mp.voice_info_used = False
+    mp.current_channel_id = None
+    mp.current_guild_id = None
 
 
 async def _do_music_open(user_id: str, guild_id: str, send_text):
@@ -548,13 +567,25 @@ async def _do_music_open(user_id: str, guild_id: str, send_text):
 async def _do_music_stop(send_text):
     """停止音乐播放并离开语音频道。"""
     mp = kook_music.music_player
-    if mp and mp.is_playing:
+    if mp and (mp.is_playing or mp.is_paused):
         mp.stop()
         if mp.current_channel_id:
             await mp.leave_channel(bot)
         await send_text("⏹️ 已停止播放并离开频道")
     else:
         await send_text("⏹️ 当前没有在播放音乐喵~")
+
+
+async def _do_music_skip(send_text):
+    """切到下一首(队列还有的话)。"""
+    mp = kook_music.music_player
+    if mp and (mp.is_playing or mp.is_paused):
+        if await mp.skip(bot):
+            await send_text("⏭️ 已切到下一首")
+        else:
+            await send_text("❌ 队列里没有下一首了")
+    else:
+        await send_text("⏭️ 当前没有在播放音乐喵~")
 
 
 async def handle_join_voice(msg: Message):
@@ -786,11 +817,11 @@ async def handle_message(msg: Message):
 
         # 音乐指令
         if content in ("music", "/music", "音乐", "听歌"):
-            await handle_music_command(msg, bot, khl_api)
+            await handle_music_command(msg, bot)
             return
-        if await handle_music_control(msg, bot, khl_api, content):
+        if await handle_music_control(msg, bot, content):
             return
-        if is_in_music_selection(user_id) and await handle_music_input(msg, bot, khl_api):
+        if is_in_music_selection(user_id) and await handle_music_input(msg, bot):
             return
 
         # AI 对话:私聊直接处理,公聊需 @
