@@ -758,11 +758,16 @@ def build_search_card(selection: dict) -> list:
     })
     modules.append({"type": "divider"})
 
-    # 选号按钮(每页最多 5 个,跟实际本页歌数一致)
+    # 选号按钮(每页最多 5 个)。KOOK action-group elements ≤ 4,
+    # 5 个按钮拆成 3+2 两组放在两行。
     pick_btns = [_btn(str(i + 1), f"search:pick:{i}", "primary")
                  for i in range(len(page_songs))]
     if pick_btns:
-        modules.append({"type": "action-group", "elements": pick_btns})
+        modules.append({"type": "action-group",
+                        "elements": pick_btns[:3]})
+        if len(pick_btns) > 3:
+            modules.append({"type": "action-group",
+                            "elements": pick_btns[3:]})
 
     # 操作按钮:全部入队 + 翻页 + 关闭
     action_btns = [_btn("➕ 全部入队", "search:all", "success")]
