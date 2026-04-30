@@ -947,7 +947,7 @@ async def handle_message(msg: Message):
             if message_type == "PrivateMessage":
                 await msg.reply("❌ 音乐卡片只能在服务器频道使用喵~")
             else:
-                await _send_or_update_music_card(msg.channel_id)
+                await _send_or_update_music_card(msg.target_id)
             return
         if await handle_music_control(msg, bot, content):
             return
@@ -993,10 +993,7 @@ async def handle_message(msg: Message):
             await msg.reply("❌ DeepSeek API 调用失败,请稍后重试")
             return
 
-        try:
-            await bot.send(msg.channel_id, response)
-        except AttributeError:
-            await msg.reply(response)
+        await bot.send(msg.target_id, response)
 
         history.append({"role": "user", "content": filtered_input})
         history.append({"role": "assistant", "content": response})

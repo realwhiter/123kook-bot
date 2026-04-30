@@ -952,7 +952,7 @@ async def handle_music_input(msg: Message, bot) -> bool:
         selection['total'] = total
         selection['page'] = 0
         selection['step'] = 'card_active'
-        await _send_or_update_search_card(bot, user_id, msg.channel_id)
+        await _send_or_update_search_card(bot, user_id, msg.target_id)
         return True
 
     return False
