@@ -47,6 +47,7 @@ if not hasattr(khl_api, "Voice"):
 
 import kook_music
 from kook_music import (
+    build_music_card,
     handle_music_command,
     handle_music_control,
     handle_music_input,
@@ -105,6 +106,9 @@ DAILY_TOKEN_LIMIT_PER_USER = 50000
 bot_id = None
 conversation_histories: dict = {}
 voice_selections: dict = {}
+# 音乐卡片当前的"持久"消息位置,用于策略 B 原地更新
+# {"msg_id": str, "target_id": str(频道 id)}
+music_card_state: dict = {"msg_id": None, "target_id": None}
 checkin_data: dict = {}
 user_database: dict = {}
 token_usage: dict = {}  # {user_id: {"date": "YYYY-MM-DD", "total": int}}
@@ -335,6 +339,9 @@ def _build_main_menu_card() -> list:
                 _btn("🚪 加入语音", "menu:join", "success"),
                 _btn("👋 离开语音", "menu:leave", "warning"),
                 _btn("🎵 点歌", "menu:music", "primary"),
+                _btn("🎮 播放器", "menu:player", "info"),
+            ]},
+            {"type": "action-group", "elements": [
                 _btn("⏭️ 下一首", "menu:next", "info"),
                 _btn("⏹️ 停止", "menu:stop", "danger"),
             ]},
@@ -418,6 +425,14 @@ async def on_btn_click(_, event: Event):
             await _do_music_stop(reply)
         elif value == "menu:next":
             await _do_music_skip(reply)
+        elif value == "menu:player":
+            # 调出音乐卡片(私聊拒绝)
+            if not channel_id:
+                await reply("❌ 音乐卡片只能在服务器频道使用喵~")
+            else:
+                await _send_or_update_music_card(channel_id)
+        elif value.startswith("music:"):
+            await _handle_music_card_button(value, user_id, channel_id, reply)
         else:
             logger.warning("未知按钮 value: %s", value)
     except Exception as e:
@@ -586,6 +601,103 @@ async def _do_music_skip(send_text):
             await send_text("❌ 队列里没有下一首了")
     else:
         await send_text("⏭️ 当前没有在播放音乐喵~")
+
+
+# ---------- 音乐卡片(策略 B:原地更新,失败回退新发) ----------
+async def _send_or_update_music_card(target_id: str):
+    """发送或就地更新音乐卡片到目标频道。
+
+    target_id:KOOK 频道 id(私聊禁用,这里假定调用方已过滤)。
+    内部维护 music_card_state["msg_id"] / ["target_id"]:
+    - 同频道有旧卡 → 调 Message.update;失败(被删/找不到)→ 重发并刷新 state
+    - 不同频道或无记录 → 直接 Message.create 新发
+    """
+    mp = kook_music.music_player
+    if mp is None:
+        # 用户从来没初始化过,造一个空 player 让卡片显示空闲态
+        kook_music._ensure_player()
+        mp = kook_music.music_player
+    card = build_music_card(mp)
+    content = json.dumps(card, ensure_ascii=False)
+
+    same_target = (music_card_state.get("target_id") == target_id
+                   and music_card_state.get("msg_id"))
+    if same_target:
+        try:
+            await bot.client.gate.exec_req(khl_api.Message.update(
+                msg_id=music_card_state["msg_id"], content=content))
+            return
+        except Exception as e:
+            logger.warning("⚠️ 更新音乐卡片失败,改为重发: %s", e)
+            music_card_state["msg_id"] = None
+
+    try:
+        result = await bot.client.gate.exec_req(khl_api.Message.create(
+            type=MessageTypes.CARD.value, target_id=target_id, content=content))
+        new_msg_id = (result or {}).get("msg_id")
+        if new_msg_id:
+            music_card_state["msg_id"] = new_msg_id
+            music_card_state["target_id"] = target_id
+        else:
+            logger.warning("⚠️ Message.create 未返回 msg_id: %s", result)
+    except Exception as e:
+        logger.error("❌ 发送音乐卡片失败: %s", e)
+
+
+async def _handle_music_card_button(value: str, user_id: str,
+                                    channel_id: str, reply):
+    """处理音乐卡片上的 music:* 按钮。所有动作完成后刷新卡片。
+
+    music:add 单独处理:进入搜歌文字流程,不刷新卡(因为下一步是用户输入)。
+    """
+    if not channel_id:
+        await reply("❌ 音乐卡片只能在服务器频道使用喵~")
+        return
+
+    mp = kook_music.music_player
+
+    if value == "music:pause":
+        if mp and await mp.pause():
+            pass
+        else:
+            await reply("❌ 当前没有在播放")
+            return
+    elif value == "music:resume":
+        if mp and await mp.resume(bot):
+            pass
+        else:
+            await reply("❌ 没有可继续的播放")
+            return
+    elif value == "music:next":
+        if mp and (mp.is_playing or mp.is_paused) and await mp.skip(bot):
+            pass
+        else:
+            await reply("❌ 队列里没有下一首了")
+            return
+    elif value == "music:stop":
+        if mp and (mp.is_playing or mp.is_paused):
+            mp.stop()
+            if mp.current_channel_id:
+                await mp.leave_channel(bot)
+        # 不论是否在播,都刷新卡片到空闲态
+    elif value == "music:clear":
+        if mp:
+            mp.clear_queue()
+    elif value == "music:refresh":
+        pass  # 仅刷新
+    elif value == "music:add":
+        # 等同点 [🎵 点歌]:开搜歌流程
+        gid = await _resolve_guild_id(channel_id)
+        if not gid:
+            await reply("❌ 无法获取服务器信息")
+            return
+        await _do_music_open(user_id, gid, reply)
+        return  # 不刷新卡(下一步走文字流程)
+    else:
+        logger.warning("未知音乐卡按钮: %s", value)
+        return
+
+    await _send_or_update_music_card(channel_id)
 
 
 async def handle_join_voice(msg: Message):
@@ -818,6 +930,14 @@ async def handle_message(msg: Message):
         # 音乐指令
         if content in ("music", "/music", "音乐", "听歌"):
             await handle_music_command(msg, bot)
+            return
+        # 音乐播放器卡片(私聊禁用,因为播放器是全局共享的)
+        if content in ("音乐卡", "播放器", "播放控制",
+                       "music_card", "/music_card", "player", "/player"):
+            if message_type == "PrivateMessage":
+                await msg.reply("❌ 音乐卡片只能在服务器频道使用喵~")
+            else:
+                await _send_or_update_music_card(msg.channel_id)
             return
         if await handle_music_control(msg, bot, content):
             return

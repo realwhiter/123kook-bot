@@ -355,6 +355,15 @@ class MusicPlayer:
         ok, _ = await self.play(bot, None, next_song)
         return ok
 
+    def get_progress_ms(self) -> int:
+        """已播 ms(wall-clock 估算,精度 ~1-2s)。暂停时停在 _paused_offset_ms。"""
+        if self.is_paused:
+            return self._paused_offset_ms
+        if self.is_playing and self._play_started_at is not None:
+            elapsed = (time.monotonic() - self._play_started_at) * 1000
+            return self._paused_offset_ms + int(elapsed)
+        return 0
+
     def get_status(self) -> str:
         if self.is_paused and self.playlist:
             cur = self.playlist[self.current_index]
@@ -392,6 +401,114 @@ class MusicPlayer:
         else:
             self.playlist = []
             self.current_index = 0
+
+
+def _fmt_duration_ms(ms: int) -> str:
+    """ms → 'M:SS' 或 'H:MM:SS'。无效输入返回 '?'。"""
+    if not ms or ms <= 0:
+        return "?"
+    s = int(ms / 1000)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
+def build_music_card(player: "MusicPlayer") -> list:
+    """生成音乐播放器主卡片(KOOK 卡片 JSON)。
+
+    空闲态:只有 [🎵 加歌] / [📋 队列] 两个按钮。
+    播放态:展示当前曲目 + 进度 + 队列窗口 + 6 个控制按钮。
+    """
+    def _btn(text, value, theme="primary"):
+        return {"type": "button", "theme": theme, "click": "return-val",
+                "value": value, "text": {"type": "plain-text", "content": text}}
+
+    modules = [{
+        "type": "header",
+        "text": {"type": "plain-text", "content": "🎵 音乐播放器"},
+    }]
+
+    if not player.is_playing and not player.is_paused:
+        # 空闲态
+        modules.append({
+            "type": "section",
+            "text": {"type": "kmarkdown",
+                     "content": "📭 **当前没在播放**\n\n点 [🎵 加歌] 开始点歌喵~"},
+        })
+        modules.append({"type": "action-group", "elements": [
+            _btn("🎵 加歌", "music:add", "primary"),
+            _btn("🔄 刷新", "music:refresh", "info"),
+        ]})
+        return [{"type": "card", "theme": "secondary", "size": "lg",
+                 "modules": modules}]
+
+    # 播放/暂停态:显示当前曲目 + 进度
+    cur = player.playlist[player.current_index] if player.playlist else {}
+    name = cur.get("name", "?")
+    artist = cur.get("artist", "?")
+    duration_ms = cur.get("duration", 0)
+    progress_ms = player.get_progress_ms()
+    state_icon = "⏸️" if player.is_paused else "▶️"
+    state_text = "已暂停" if player.is_paused else "正在播放"
+    progress_str = _fmt_duration_ms(progress_ms)
+    duration_str = _fmt_duration_ms(duration_ms)
+
+    modules.append({
+        "type": "section",
+        "text": {"type": "kmarkdown",
+                 "content": (f"{state_icon} **{state_text}**\n\n"
+                             f"《{name}》 - {artist}\n"
+                             f"⏱️ {progress_str} / {duration_str}")},
+    })
+
+    # 队列窗口:当前 ± 几首,过长用省略提示
+    if player.playlist:
+        total = len(player.playlist)
+        # 显示当前前 1 后 5,最多 7 行
+        start = max(0, player.current_index - 1)
+        end = min(total, player.current_index + 6)
+        lines = [f"📋 **队列(共 {total} 首):**"]
+        if start > 0:
+            lines.append(f"  ⋯ ({start} 首已播)")
+        for i in range(start, end):
+            s = player.playlist[i]
+            if i == player.current_index and player.is_playing:
+                mark = "▶️"
+            elif i == player.current_index and player.is_paused:
+                mark = "⏸️"
+            elif i < player.current_index:
+                mark = "✅"
+            else:
+                mark = "▫️"
+            lines.append(f"{mark} {i+1}. {s['name']} - {s.get('artist','?')}")
+        if end < total:
+            lines.append(f"  ⋯ (还有 {total - end} 首)")
+        modules.append({"type": "divider"})
+        modules.append({
+            "type": "section",
+            "text": {"type": "kmarkdown", "content": "\n".join(lines)},
+        })
+
+    # 控制按钮:暂停/继续动态切换
+    play_pause_btn = (_btn("▶️ 继续", "music:resume", "success")
+                      if player.is_paused
+                      else _btn("⏸️ 暂停", "music:pause", "primary"))
+    modules.append({"type": "divider"})
+    modules.append({"type": "action-group", "elements": [
+        play_pause_btn,
+        _btn("⏭️ 下一首", "music:next", "info"),
+        _btn("⏹️ 停止", "music:stop", "danger"),
+    ]})
+    modules.append({"type": "action-group", "elements": [
+        _btn("🎵 加歌", "music:add", "primary"),
+        _btn("🗑️ 清空", "music:clear", "warning"),
+        _btn("🔄 刷新", "music:refresh", "info"),
+    ]})
+
+    return [{"type": "card", "theme": "secondary", "size": "lg",
+             "modules": modules}]
 
 
 class MusicAPI:
