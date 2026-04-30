@@ -13,8 +13,14 @@ import asyncio
 import json
 import logging
 import subprocess
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
+
+# 测试用:把 KOOK voice/join 返回的 bitrate 改写成强制值(单位 kbps)
+# 默认 None = 跟 KOOK 给的码率(目前固定 48k)。改成 96 等高值会被
+# KOOK 服务端检测到超速,可能直接踢出语音频道甚至处罚账号,仅供验证用。
+FORCE_BITRATE_KBPS: Optional[int] = None
 
 import aiohttp
 import khl.api as khl_api
@@ -153,8 +159,14 @@ class MusicPlayer:
         rtcp_mux = voice_info.get('rtcp_mux', True)
         # KOOK 服务端硬限制推流码率(默认 48000),超过 120% 会被踢出频道
         # voice/join 返回的 bitrate 才是当前频道允许的上限,以它为准
-        bitrate = voice_info.get('bitrate', 48000)
-        bitrate_kbps = max(8, int(bitrate) // 1000)
+        if FORCE_BITRATE_KBPS:
+            bitrate_kbps = FORCE_BITRATE_KBPS
+            logger.warning(f"⚠️ FORCE_BITRATE_KBPS={FORCE_BITRATE_KBPS}k 强制覆盖 "
+                           f"KOOK 默认 {voice_info.get('bitrate', 48000) // 1000}k,"
+                           "如被踢出请改回 None")
+        else:
+            bitrate = voice_info.get('bitrate', 48000)
+            bitrate_kbps = max(8, int(bitrate) // 1000)
 
         rtp_url = f"rtp://{ip}:{port}"
         if not rtcp_mux and 'rtcp_port' in voice_info:
@@ -182,14 +194,24 @@ class MusicPlayer:
         cmd = self._build_ffmpeg_cmd(song_url, voice_info, offset_ms)
         logger.debug(f"FFmpeg cmd: {' '.join(cmd)}")
         try:
-            return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+            # stdout 直接丢:RTP 输出走 socket 不进 stdout,留着浪费
+            # stderr 留 PIPE,启动失败时还能拿到错误信息;启动通过后由
+            # _wait_ffmpeg_alive 启动 daemon thread drain,防缓冲区满死锁
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE)
         except Exception as e:
             logger.error(f"❌ FFmpeg 启动异常: {e}")
             return None
 
     async def _wait_ffmpeg_alive(self, proc: subprocess.Popen) -> Tuple[bool, str]:
-        """启动后短暂等待,确认 ffmpeg 没立刻挂掉。"""
+        """启动后短暂等待,确认 ffmpeg 没立刻挂掉。
+
+        通过启动检查后,起一个 daemon thread 持续 drain stderr。
+        ffmpeg `-re` 模式每秒往 stderr 写 progress 行(`size=... time=...`),
+        不读会让 Windows 上 ~4-64KB 的管道缓冲区在几分钟内打满,导致
+        ffmpeg write 阻塞 → 整个进程僵死(既不推流也不退出),monitor
+        干等永远等不到 process.poll() != None。这是经典 subprocess footgun。
+        """
         await asyncio.sleep(0.5)
         if proc.poll() is not None:
             stderr = (proc.stderr.read().decode('utf-8', errors='ignore')
@@ -200,6 +222,9 @@ class MusicPlayer:
             stderr = (proc.stderr.read().decode('utf-8', errors='ignore')
                       if proc.stderr else '')
             return False, f"FFmpeg 启动后退出: {stderr[-200:]}"
+        # 启 drain thread 防止 stderr 缓冲区满
+        threading.Thread(target=_drain_stderr, args=(proc,),
+                         daemon=True, name="ffmpeg-stderr-drain").start()
         return True, ""
 
     def _terminate_process(self):
@@ -509,6 +534,24 @@ class MusicPlayer:
         else:
             self.playlist = []
             self.current_index = 0
+
+
+def _drain_stderr(proc: subprocess.Popen):
+    """daemon thread:持续读 ffmpeg stderr 防止管道缓冲区满阻塞写端。
+
+    内容默认丢弃。需要排查时把 logger.debug 改 logger.info 就能看到 ffmpeg
+    每秒的 progress 行。
+    """
+    try:
+        while True:
+            chunk = proc.stderr.readline()
+            if not chunk:
+                break
+            # 默认 debug 级,需要时通过 logging 配置打开
+            logger.debug("ffmpeg: %s",
+                         chunk.decode('utf-8', errors='ignore').rstrip())
+    except Exception:
+        pass
 
 
 def _fmt_duration_ms(ms: int) -> str:
